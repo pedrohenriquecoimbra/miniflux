@@ -1,0 +1,31 @@
+miniflux — a minimal eddy-covariance flux program
+Copyright (c) 2026 Pedro Henrique Herig Coimbra
+Licensed under the EUPL-1.2 (see LICENCE).
+
+Derived from
+------------
+miniflux is a minimal reimplementation of the flux path of `oneflux_preproc`
+v0.10.0 (https://github.com/pedrohenriquecoimbra/ONEFlux-preproc), by the same
+author, also under the EUPL-1.2. The physics, the constants and the numerical
+conventions were taken from that reference implementation; the code is written
+from scratch against the standard library, and the pipeline is a plain ordered
+list of functions rather than a registry.
+
+`oneflux_preproc` is the reference: it carries the engine comparisons, the
+provenance record, the spectral corrections and the published parity against
+EddyPro and GEddySoft. miniflux carries none of that on purpose. Where the two
+disagree numerically, `oneflux_preproc` is right and miniflux has a bug.
+
+Methods implemented here, and the work they come from
+-----------------------------------------------------
+Despiking                 Mauder et al. (2013), Agric. For. Meteorol. 169, 122-135
+Double rotation           Wilczak et al. (2001), Boundary-Layer Meteorol. 99, 127-150
+                          after Tanner & Thurtell (1969)
+Sonic temperature (H)     Schotanus et al. (1983), Boundary-Layer Meteorol. 26, 81-93
+                          in the form of van Dijk et al. (2004)
+Density (WPL)             Webb, Pearman & Leuning (1980), Q. J. R. Meteorol. Soc. 106, 85-100
+Time-lag maximisation     as in EddyPro's covariance-maximisation, cf. Fan et al. (1990)
+Steady state, ITC         Foken & Wichura (1996), Agric. For. Meteorol. 78, 83-105
+                          flag policy after Mauder & Foken (2004)
+
+Full formulas, constants and conventions: docs/ALGORITHMS.md.

@@ -1,0 +1,35 @@
+# miniflux has no runtime dependencies. A checkout runs as-is:
+#     python -m miniflux run examples/miniflux.ini
+# This file exists so `pip install .` works, not because anything is needed.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miniflux-ec"
+version = "0.1.0"
+description = "A minimal eddy-covariance flux program: raw high-frequency data in, one flux row per averaging period out, on the standard library alone."
+readme = "README.md"
+license = "EUPL-1.2"
+license-files = ["LICENCE"]
+requires-python = ">=3.8"
+authors = [{name = "Pedro Henrique Coimbra", email = "pedro-henrique.herig-coimbra@inrae.fr"}]
+keywords = ["eddy covariance", "flux", "micrometeorology", "minimal"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Purely a speed switch: the same numbers, computed faster. Nothing imports
+# numpy at module level; kernels.py probes for it once and falls back.
+fast = ["numpy>=1.17"]
+
+[project.scripts]
+miniflux = "miniflux.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["miniflux*"]

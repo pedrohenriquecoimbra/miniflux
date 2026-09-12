@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+out/
+*.out.csv
+
+# Run artifacts: benchmark and smoke-run output, and the synthetic sample.
+miniflux.csv
+*_units.csv
+sample_*.dat
