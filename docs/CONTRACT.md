@@ -35,12 +35,14 @@ period = {
     'h2o':   array('d'),
     'ta':    array('d'),         # all-NaN when no air-temperature column exists
     'p_air': array('d'),         # constant-filled when [site] pressure_pa is used
+    't_cell': array('d'),        # analyser CELL temperature; all-NaN on an open-path run
+    'p_cell': array('d'),        # analyser CELL pressure;    all-NaN on an open-path run
 }
 ```
 
-All nine series keys are **always present** and always `array('d')` of the same length `N`.
-A variable with no source in the file is an all-NaN array, never a missing key. `t` is a
-plain `list` of `datetime.datetime` (naive, no timezone), length `N`, non-decreasing.
+All eleven series keys are **always present** and always `array('d')` of the same length
+`N`. A variable with no source in the file is an all-NaN array, never a missing key. `t` is
+a plain `list` of `datetime.datetime` (naive, no timezone), length `N`, non-decreasing.
 
 `period['meta']` is **flat**: string keys, scalar values. No nesting, no tuples as keys.
 Every meta key is listed in §17.
@@ -59,7 +61,13 @@ handled by the caller, which always rebinds). A step:
 
 * must not raise on physically degenerate data — it writes `float('nan')` and logs at
   `WARNING`;
-* must not read a config key outside its own section (plus `[period]`, which is global);
+* must not read a config key outside its own section, plus the three that are global
+  because they describe the measurement rather than a stage: `[period]`, `[site]` and
+  `[gases]`. When it reads `[gases]`, it reads `measure_type` — the effective type of
+  §5.1 — unless it is `cell.py`, which is the step that *causes* the difference;
+* must not mutate `cfg`. A step sees one `Config` shared by every period, so a decision
+  that depends on the configuration is resolved once in `config.py` (§5.1) and read, never
+  written back;
 * must not import another step module (steps are independent; shared code lives in
   `kernels.py`, `constants.py` or `flux.py` helpers).
 
@@ -83,14 +91,21 @@ log messages. Nothing else in the program has a name.
 | `h2o` | H2O dry mole fraction **or** molar density | mol mol-1 (dry) \| mol m-3 | file column, same |
 | `ta` | measured ambient air temperature | K | file column if declared, else all-NaN |
 | `p_air` | ambient (barometric) pressure | Pa | file column if declared, else the declared constant |
+| `t_cell` | analyser **cell** temperature | K | file column if declared, else all-NaN |
+| `p_cell` | analyser **cell** pressure | Pa | file column if declared, else all-NaN |
 
 `co2` and `h2o` carry the unit implied by their `measure_type`: `mixing_ratio` -> dry mole
 fraction in **mol mol-1** (a 420 ppm signal is `4.20e-4`); `molar_density` -> **mol m-3**.
 `read.py` performs that normalisation; no scale factor survives past `read.py`.
 
-Names that exist in the parent and deliberately **do not** exist here: `cell_t`,
-`cell_pressure` (closed-path only — refused, see §20.4), `ch4` and any other gas, `sos`,
-diagnostic/status columns.
+`t_cell` and `p_cell` are read and converted like any other scalar but are **not
+canonical**: they may not be named in `[despike] variables`, `[detrend] variables`,
+`[lag] scalars` or `[qc] steady_state_pair` (refusal 5.2.9 covers them by omission). They
+enter no covariance, and `cell.convert` has consumed them before `despike` runs, so naming
+them in one of those lists would be a no-op that reads like a safeguard.
+
+Names that exist in the parent and deliberately **do not** exist here: `ch4` and any other
+gas, `sos`, diagnostic/status columns.
 
 ---
 
@@ -263,8 +278,8 @@ def describe(cfg)              -> str         # every resolved key, one per line
 `Config` is a plain object whose attributes are `types.SimpleNamespace` instances, one per
 `.ini` section: `cfg.files`, `cfg.site`, `cfg.period`, `cfg.timestamp`, `cfg.variables`,
 `cfg.units`, `cfg.gases`, `cfg.despike`, `cfg.rotate`, `cfg.lag`, `cfg.detrend`, `cfg.wpl`,
-`cfg.qc`, `cfg.output`, `cfg.runtime`. Values are already typed (float, int, bool, str,
-list of str, dict).
+`cfg.spectral`, `cfg.qc`, `cfg.output`, `cfg.runtime`. Values are already typed (float,
+int, bool, str, list of str, dict).
 
 `load` parses with `configparser.ConfigParser(inline_comment_prefixes=('#', ';'))`, applies
 the defaults of §6, coerces types, validates, and raises `ConfigError` with a message naming
@@ -279,14 +294,24 @@ the section and key on the first problem. It never guesses.
 | `cfg.site.displacement` | float | declared if non-empty and > 0; else `2/3 * canopy_height` if that is > 0; else 0.0 with a `WARNING` |
 | `cfg.units.convert[name]` | `(a, b)` | affine `x_canonical = a*x_file + b`, per §6.4 |
 | `cfg.lag.windows[scalar]` | `(nominal_s, min_s, max_s)` | one entry per scalar in `[lag] scalars` |
-| `cfg.gases.measure_type[gas]` | str | `'mixing_ratio'` or `'molar_density'` |
+| `cfg.gases.reported[gas]` | str | `'mixing_ratio'` or `'molar_density'`, as the **file** writes it |
+| `cfg.gases.convert_cell` | tuple of str | the gases `cell.convert` rewrites: `analyser_path = closed` **and** reported as a `molar_density` |
+| `cfg.gases.measure_type[gas]` | str | the **effective** type, after that rewrite: `'mixing_ratio'` for a gas in `convert_cell`, else `reported[gas]` |
+
+**The difference between the last two rows is the whole of miniflux's closed-path
+support.** Every consumer of "how was this gas measured?" — the flux factor (§11.4), the
+mean densities (§11.2), and whether WPL is owed (§12) — reads `measure_type`, so a gas
+that `cell.convert` has turned into a dry mixing ratio needs no branch anywhere else, and
+`flux.py` and `wpl.py` contain no test for a cell. Only `cell.py` reads `reported` and
+`convert_cell`. It is resolved once, here, because a step may not mutate `cfg` and three
+modules asking the same question at run time is three chances to disagree.
 
 ### 5.2 Refusals (all `ConfigError`)
 
 1. `closed` not in `{left, right}`; `timestamp.format` not in `{iso, numeric}`;
    `detrend.method` not in `{block, linear}`; `rotate.method` not in `{double, none}`;
    `lag.method` not in `{covmax_default, covmax, fixed, none}`; `wpl.enabled` not in
-   `{auto, on, off}`.
+   `{auto, on, off}`; `gases.analyser_path` not in `{open, closed}`.
 2. A `measure_type` of `mole_fraction` (or anything else): *"miniflux supports
    `mixing_ratio` (dry) and `molar_density` only; convert a wet mole fraction upstream"*.
 3. A `[units]` value inconsistent with the gas's `measure_type` (e.g. `co2 = ppm` with
@@ -306,6 +331,22 @@ the section and key on the first problem. It never guesses.
     one label — two different numbers wearing the same name, with nothing in the file to
     tell them apart. Refused rather than emitted. (Numbered last to keep the `5.2.N`
     references in `config.py` and `tests/test_config.py` pointing where they did.)
+12. **A cell density with no cell state.** `analyser_path = closed` and a gas reported as
+    a `molar_density`, with `[variables] t_cell` or `p_cell` empty. That gas is a density
+    *in the analyser cell* and cannot be converted without the temperature and pressure it
+    was measured at; the **ambient** ones describe air that has not been through the tube
+    and are never substituted (ALGORITHMS 2A.4). The message says so and names the way
+    out: declare the dry mixing ratio the analyser also reports.
+
+    The converse is only a **warning**: a `t_cell` / `p_cell` declared where no gas needs
+    one is read and unused. The asymmetry is the refusal principle of §19 applied
+    literally — the first case produces a wrong number, the second produces two columns of
+    reading.
+13. **A spectral correction with no time constant.** `[spectral] enabled = true` with
+    `co2_tau_s` or `h2o_tau_s` unset or non-positive. The constant belongs to one tube at
+    one flow rate; miniflux ships no default, because a default would put a plausible few
+    per cent on every flux of every user who enabled the section without reading it
+    (ALGORITHMS 10A.4).
 
 `describe(cfg)` prints every resolved value including the derived ones, so a run's log
 records exactly what it used — including a fabricated-free statement of where the pressure
@@ -368,17 +409,27 @@ co2   = CO2
 h2o   = H2O
 ta    =                          # measured air temperature; empty -> derived from ts per sample
 p_air = Press                    # ambient pressure; empty -> [site] pressure_pa
+t_cell =                         # analyser CELL temperature; required only when a gas below is a
+p_cell =                         # molar_density AND analyser_path = closed. Warned if set otherwise.
 
 [units]                          # the unit of each column AS WRITTEN IN THE FILE
 ts    = K                        # K | degC
 ta    = K                        # K | degC
 p_air = Pa                       # Pa | hPa | kPa
+t_cell = degC                    # K | degC  -- the LI-7200/LI-7000 native unit, not K
+p_cell = kPa                     # Pa | hPa | kPa  -- ditto
 co2   = ppm                      # ppm | umol/mol | mmol/m3 | mol/m3 | mg/m3 | g/m3
 h2o   = ppt                      # ppt | mmol/mol | mmol/m3 | mol/m3 | mg/m3 | g/m3
 
 [gases]
 co2_measure_type = mixing_ratio  # mixing_ratio (per mole of DRY air) | molar_density
 h2o_measure_type = mixing_ratio  # mole_fraction (wet) is refused -- see CONTRACT section 20.4
+analyser_path    = open          # open | closed. closed says the numbers above describe the air in
+                                 # the analyser's CELL, not at the tower: a molar_density is then
+                                 # converted per sample to a dry mixing ratio from t_cell and
+                                 # p_cell (ALGORITHMS 2A), and no ambient WPL is owed. A closed-path
+                                 # analyser's own DRY mixing ratio (CO2_DRY / H2O_DRY) needs no cell
+                                 # state at all and is the exact, recommended declaration.
 
 [despike]
 enabled   = true
@@ -407,6 +458,14 @@ enabled = auto                   # auto -> run only when a gas is a molar_densit
                                  # on   -> run whenever the inputs exist
                                  # off  -> never; a gas that is OWED a correction then gets NO reported flux
 
+[spectral]                       # first-order low-pass recovery factor, Horst (1997) Eq. 11
+enabled   = false                # true -> publish SCF_CO2/SCF_H2O and FC_SPEC/LE_SPEC/E_SPEC beside
+                                 # the measured FC/LE/E. It never rewrites a flux column.
+                                 # This is an approximation from declared geometry, NOT a substitute
+                                 # for an in-situ method (EddyPro, oneflux_preproc).
+co2_tau_s =                      # first-order time constant of the CO2 channel [s]; required when
+h2o_tau_s =                      # enabled, and never guessed -- it belongs to THIS tube and flow.
+
 [qc]
 steady_state_pair = w,co2        # the covariance the FW96 test is run on
 itc               = true         # compute the three ITC deviations
@@ -425,6 +484,14 @@ float_format = %.6g              # applied to every float column
 | `Pa` | Pa | 1.0 | 0.0 |
 | `hPa` | Pa | 100.0 | 0.0 |
 | `kPa` | Pa | 1000.0 | 0.0 |
+
+The temperature row applies to `ts`, `ta` and `t_cell`; the pressure rows to `p_air` and
+`p_cell`. The two cell keys **default** to `degC` and `kPa` rather than to the canonical
+`K` and `Pa` the ambient ones default to: they exist only for a closed-path run, and
+`degC`/`kPa` is what an LI-7200 or LI-7000 writes. There is no safe default here — a cell
+temperature read as 25 K instead of 298 K is a factor of twelve on the gas — so the shipped
+one matches the instrument the key was written for.
+
 | `ppm`, `umol/mol` (mixing_ratio) | mol mol-1 | 1e-6 | 0.0 |
 | `ppt`, `mmol/mol` (mixing_ratio) | mol mol-1 | 1e-3 | 0.0 |
 | `mmol/m3` (molar_density) | mol m-3 | 1e-3 | 0.0 |
@@ -454,7 +521,11 @@ def period_bounds(t, seconds, closed) -> (datetime, datetime)       # (start, en
 ### 7.1 `periods(cfg)`
 
 Streams. It opens each file matched by `cfg.files.input_glob` in `sorted()` order, skips to
-`first_data_line` (keeping `header_line`), and reads rows with `csv.reader`. For each row it
+`first_data_line` (keeping `header_line`), and splits each row exactly as `csv.reader`
+splits it — a line carrying no quote character is cut with `str.split`, which is what a 20 Hz
+file is made of, and a line whose quotes need them is handed to `csv.reader` for that record
+alone, so a quoted field holding the delimiter, a doubled quote or a newline still parses and
+one quoted line in the middle of an unquoted file is read correctly. For each row it
 parses the timestamp, converts the declared columns with their affine map, and appends to the
 period currently being accumulated. A period is yielded as soon as a sample with a later
 period key arrives, and the last one is yielded at end of input.
@@ -463,7 +534,11 @@ Reads from config: `[files] *`, `[timestamp] *`, `[variables] *`, `[units] *`,
 `[gases] *_measure_type`, `[period] averaging_minutes/closed/min_samples`,
 `[site] pressure_pa`.
 
-Writes to the period: all nine series keys, `t`, and these meta keys:
+Every conversion `read.py` performs is **affine**. The one non-affine conversion miniflux
+does — a cell molar density into a dry mixing ratio — is a step of its own (§7A), which is
+why `t_cell` and `p_cell` arrive downstream as series instead of being consumed here.
+
+Writes to the period: all eleven series keys, `t`, and these meta keys:
 
 | meta key | type | unit | meaning |
 |---|---|---|---|
@@ -491,8 +566,55 @@ Writes to the period: all nine series keys, `t`, and these meta keys:
 
 ### 7.4 Guarantees to downstream modules
 
-`t` is non-decreasing. All nine series have equal length. A series whose column is absent is
-all-NaN (`ta`) or constant (`p_air` from `[site] pressure_pa`). Units are canonical (§2).
+`t` is non-decreasing. All eleven series have equal length. A series whose column is absent
+is all-NaN (`ta`, `t_cell`, `p_cell`) or constant (`p_air` from `[site] pressure_pa`).
+Units are canonical (§2).
+
+---
+
+## 7A. `cell.py`
+
+```python
+def convert(period, cfg) -> period
+```
+
+Config: `cfg.gases.convert_cell`, `cfg.gases.reported['h2o']` (both derived, §5.1).
+Reads: `co2`, `h2o`, `t_cell`, `p_cell`.
+
+Lettered, not numbered, to keep every existing `CONTRACT §N` reference pointing where it
+did. ALGORITHMS 2A holds the mathematics.
+
+`cfg.gases.convert_cell` empty — every open-path run, and every closed-path run already
+declared in dry mixing ratios — makes this an immediate `return period`: no series is
+touched and **no meta key is written**, so the three columns below hold `na_value`.
+
+Otherwise, per sample `i`, in this order:
+
+1. `V = R * t_cell[i] / p_cell[i]`, or `NaN` unless both are `> 0` (a zero cell pressure
+   is a broken instrument, and an infinite molar volume is not a more honest answer than
+   none);
+2. `chi = h2o[i] * V` when H2O is *reported* as a molar density, else `r/(1 + r)` — read
+   **before** step 4, because `h2o` is itself one of the series being rewritten;
+3. `factor = V / (1 - chi)`, or `NaN` when `1 - chi <= 0` or the result is not finite —
+   an infinity here would reach a covariance and take a whole flux with it, where a NaN
+   drops only the samples it touches;
+4. `period[gas][i] *= factor` for each gas in `convert_cell`.
+
+Writes:
+
+| meta key | type | unit |
+|---|---|---|
+| `t_cell_mean` | float | K |
+| `p_cell_mean` | float | Pa |
+| `v_cell_mean` | float | m3 mol-1 |
+| `chi_h2o_cell_mean` | float | mol mol-1 (of moist cell air) |
+| `n_cell_converted` | int | samples that got a finite factor |
+
+Each mean is over its own finite samples. A period with `n_cell_converted < n_in` logs once
+at `WARNING` with the count.
+
+It does **not** rewrite `cfg`: `config.py` has already resolved the effective
+`measure_type` (§5.1), which is what every other module reads.
 
 ---
 
@@ -742,7 +864,10 @@ Degenerate inputs produce `inf`/`nan` without a guard here (ALGORITHMS §9.4); `
 def correct(period, cfg) -> period
 ```
 
-Config: `[wpl] enabled`, `[gases] *_measure_type`.
+Config: `[wpl] enabled`, `cfg.gases.measure_type` — the **effective** type of §5.1, never
+`reported`. A closed-path cell density that `cell.convert` has already turned into a dry
+mixing ratio therefore reaches the "nothing owed" branch, and there is no test for a cell
+anywhere in this module (ALGORITHMS 10.1 and 2A.5).
 
 Decision table, evaluated once per period:
 
@@ -783,6 +908,51 @@ from a series (the means it reads were taken before detrending).
 
 ---
 
+## 12A. `spectral.py`
+
+```python
+def correct(period, cfg) -> period
+```
+
+Config: `[spectral] enabled/co2_tau_s/h2o_tau_s`, `[site] measurement_height` and the
+derived `cfg.site.displacement`. Reads the meta keys `wind_speed`, `z_l`, `fc`, `e`, `le`.
+ALGORITHMS 10A holds the mathematics and the caveats.
+
+`enabled = false` (the default) is an immediate `return period`: **no key is written**, so
+all five columns hold `na_value`. A correction that was not made is absent, not `1.0`.
+
+When it runs:
+
+```
+height = measurement_height - max(Z_MINUS_D_FLOOR, displacement)     # z - d, as in 11.4
+nm, alpha = (0.085, 7/8)                          if z_l <= 0
+          = (2.0 - 1.915/(1 + 0.5*z_l), 1.0)      if z_l >  0
+scf = 1 + (2*pi * nm * tau * wind_speed / height) ** alpha
+```
+
+evaluated once per gas with that gas's `tau`.
+
+Writes:
+
+| meta key | type | unit |
+|---|---|---|
+| `scf_co2`, `scf_h2o` | float | - (>= 1) |
+| `fc_spec` | float | mol m-2 s-1 |
+| `e_spec` | float | kg m-2 s-1 |
+| `le_spec` | float | W m-2 |
+
+`fc_spec = fc * scf_co2`; `e_spec = e * scf_h2o`; `le_spec = le * scf_h2o`. **It never
+rewrites `fc`, `e`, `le` or their `_L0` forms**, and it never scales `h`: a gas time
+constant does not describe the sonic. A source key that is *absent* (a gas whose reported
+flux `wpl.py` withheld) leaves its `_spec` key absent too — a corrected name over a flux
+that was deliberately not reported would be worse than either.
+
+Guards, each `NaN` plus a `WARNING`: `height <= 0`, `wind_speed` or `z_l` non-finite. A
+factor above `IMPLAUSIBLE_FACTOR = 2.0` is warned about and **not** clipped: clipping would
+invent a number, but above it more than half the reported flux comes from the model.
+
+---
+
 ## 13. `qc.py`
 
 ```python
@@ -813,6 +983,7 @@ Running it earlier silently returns the neutral wind models computed on an absen
 
 ```python
 STEPS = [
+    ('cell',           cell.convert),
     ('despike',        despike.despike),
     ('rotate',         rotate.rotate),
     ('lag',            lag.apply_lags),
@@ -821,6 +992,7 @@ STEPS = [
     ('moments',        flux.moments),
     ('assemble',       flux.assemble),
     ('wpl',            wpl.correct),
+    ('spectral',       spectral.correct),
     ('qc',             qc.quality),
 ]
 
@@ -832,17 +1004,25 @@ The order is normative and every position in it is load-bearing:
 
 | position | why it must be there |
 |---|---|
-| `despike` first | the median/MAD threshold must see raw, un-rotated, un-detrended values |
+| `cell` first | the MAD threshold should see the conserved quantity, not the cell's own T/P fluctuations — and a spike in `t_cell`, screened nowhere else, only becomes visible once it is a spike in the gas |
+| `despike` next | the median/MAD threshold must see raw, un-rotated, un-detrended values |
 | `rotate` before `lag` | the lag search runs on the **rotated** w |
 | `lag` before `thermodynamics` | so every period mean is taken over the samples that actually enter the covariances |
 | `thermodynamics` before `detrend` | detrending destroys exactly the means WPL and the flux factor need |
 | `detrend` before `moments` | block average changes nothing; linear detrend does |
 | `assemble` before `wpl` | WPL consumes the Schotanus-corrected `h` |
+| `wpl` before `spectral` | the factor scales the **reported** flux, so `FC_SPEC` is one multiplication away from `FC` (§20.14) |
 | `qc` last | ITC needs `z_l` |
 
 `run(cfg, writer)` iterates `read.periods(cfg)`, calls `run_period`, hands each finished
 period to the writer, and returns
 `{'periods': int, 'skipped_short': int, 'rows': int, 'warnings': int}`.
+
+Before the loop, and **once per run**, `run` logs at `WARNING` that a closed-path table
+with `[spectral] enabled = false` carries attenuated — i.e. underestimated — FC, LE and E
+(ALGORITHMS 10A.1). It is a property of the configuration, not of a period, so 48 copies
+of it would be noise the real warnings hide behind; it is emitted inside the counted
+region, so it appears in `summary['warnings']`.
 
 A step that raises is caught in `run_period`: the period is logged at `ERROR` with the step
 name and the period label, the remaining steps are skipped, and the row is still written with
@@ -905,6 +1085,10 @@ python -m miniflux check CONFIG.ini            # parse + validate + echo describ
 | `period_start`, `period_end` | datetime | - | read |
 | `n_in`, `n_dup` | int | samples | read |
 | `freq_hz` | float | Hz | read |
+| `t_cell_mean`, `p_cell_mean` | float | K, Pa | cell |
+| `v_cell_mean` | float | m3 mol-1 | cell |
+| `chi_h2o_cell_mean` | float | mol mol-1 | cell |
+| `n_cell_converted` | int | samples | cell |
 | `n_spike_<var>` | int | samples | despike |
 | `u_unrot_mean`, `v_unrot_mean`, `w_unrot_mean` | float | m s-1 | rotate |
 | `wind_speed` | float | m s-1 | rotate |
@@ -921,7 +1105,13 @@ python -m miniflux check CONFIG.ini            # parse + validate + echo describ
 | `f_co2`, `f_h2o`, `fc_l0`, `fh2o_l0`, `e_l0`, `le_l0`, `h_l0`, `h`, `theta_s`, `mo_length`, `z_l` | float | see §11.4 | assemble |
 | `fc`, `e`, `le`, `wt` | float | see §12 | wpl |
 | `wpl_applied` | bool | - | wpl |
+| `scf_co2`, `scf_h2o` | float | - | spectral |
+| `fc_spec`, `e_spec`, `le_spec` | float | see §12A | spectral |
 | `sst_pct`, `sst_flag`, `itc_w`, `itc_u`, `itc_t`, `tstar` | float/int | see §13 | qc |
+
+The six `cell` keys and the five `spectral` keys are written **only** when that step does
+something (a gas in `cfg.gases.convert_cell`; `[spectral] enabled = true`). Absent is how
+"this run did not do that" is spelled, and `write.py` renders it as `na_value`.
 
 `detrend` writes `ts_mean`, `co2_mean` and `h2o_mean` for variables `thermodynamics` has
 already summarised, over the same samples. **The two are not bit-identical, and the
@@ -961,52 +1151,67 @@ Order is normative. `unit` is the **published** unit, which differs from the met
 | 8 | `N_SPIKE_TS` | `n_spike_ts` | samples |
 | 9 | `N_SPIKE_CO2` | `n_spike_co2` | samples |
 | 10 | `N_SPIKE_H2O` | `n_spike_h2o` | samples |
-| 11 | `WS` | `wind_speed` | m s-1 |
-| 12 | `WD` | `wind_dir` | deg from north |
-| 13 | `THETA` | `theta` | deg (scaled here) |
-| 14 | `PHI` | `phi` | deg (scaled here) |
-| 15 | `USTAR` | `ustar` | m s-1 |
-| 16 | `MO_LENGTH` | `mo_length` | m |
-| 17 | `ZL` | `z_l` | - |
-| 18 | `TA` | `ta_mean` | K |
-| 19 | `T_SONIC` | `ts_mean` | K |
-| 20 | `PA` | `p_air_mean` | Pa |
-| 21 | `RH` | `rh_mean` | % |
-| 22 | `CO2_MEAN` | `co2_dry_ppm` | umol mol-1 (dry air) |
-| 23 | `H2O_MEAN` | `h2o_dry_ppt` | mmol mol-1 (dry air) |
-| 24 | `RHO_A` | `rho_m_mean` | kg m-3 (moist air) |
-| 25 | `Q` | `q_mean` | kg kg-1 |
-| 26 | `CP` | `cp_mean` | J kg-1 K-1 |
-| 27 | `LAMBDA_V` | `lambda_v_mean` | J kg-1 |
-| 28 | `VAR_U` | `var_u` | m2 s-2 |
-| 29 | `VAR_V` | `var_v` | m2 s-2 |
-| 30 | `VAR_W` | `var_w` | m2 s-2 |
-| 31 | `VAR_TS` | `var_ts` | K2 |
-| 32 | `COV_U_W` | `cov_u_w` | m2 s-2 |
-| 33 | `COV_V_W` | `cov_v_w` | m2 s-2 |
-| 34 | `COV_W_TS` | `cov_w_ts` | K m s-1 |
-| 35 | `CO2_LAG` | `co2_lag_s` | s |
-| 36 | `CO2_LAG_OPT` | `co2_lag_opt_s` | s |
-| 37 | `CO2_LAG_DEFAULT` | `co2_lag_default_used` | 0/1 |
-| 38 | `H2O_LAG` | `h2o_lag_s` | s |
-| 39 | `H2O_LAG_OPT` | `h2o_lag_opt_s` | s |
-| 40 | `H2O_LAG_DEFAULT` | `h2o_lag_default_used` | 0/1 |
-| 41 | `H_L0` | `h_l0` | W m-2 |
-| 42 | `H` | `h` | W m-2 |
-| 43 | `FC_L0` | `fc_l0` | umol m-2 s-1 (scaled 1e6) |
-| 44 | `FC` | `fc` | umol m-2 s-1 (scaled 1e6) |
-| 45 | `LE_L0` | `le_l0` | W m-2 |
-| 46 | `LE` | `le` | W m-2 |
-| 47 | `E_L0` | `e_l0` | g m-2 s-1 (scaled 1e3) |
-| 48 | `E` | `e` | g m-2 s-1 (scaled 1e3) |
-| 49 | `WPL_APPLIED` | `wpl_applied` | 0/1 |
-| 50 | `SST_PCT` | `sst_pct` | % |
-| 51 | `SST_FLAG` | `sst_flag` | 0/1/2 |
-| 52 | `ITC_W` | `itc_w` | fraction |
-| 53 | `ITC_U` | `itc_u` | fraction |
-| 54 | `ITC_T` | `itc_t` | fraction (uses \|T*\|, see §20.5) |
+| 11 | `N_CELL_CONV` | `n_cell_converted` | samples |
+| 12 | `WS` | `wind_speed` | m s-1 |
+| 13 | `WD` | `wind_dir` | deg from north |
+| 14 | `THETA` | `theta` | deg (scaled here) |
+| 15 | `PHI` | `phi` | deg (scaled here) |
+| 16 | `USTAR` | `ustar` | m s-1 |
+| 17 | `MO_LENGTH` | `mo_length` | m |
+| 18 | `ZL` | `z_l` | - |
+| 19 | `TA` | `ta_mean` | K |
+| 20 | `T_SONIC` | `ts_mean` | K |
+| 21 | `PA` | `p_air_mean` | Pa |
+| 22 | `T_CELL` | `t_cell_mean` | K (the analyser CELL, not ambient) |
+| 23 | `P_CELL` | `p_cell_mean` | Pa (ditto) |
+| 24 | `RH` | `rh_mean` | % |
+| 25 | `CO2_MEAN` | `co2_dry_ppm` | umol mol-1 (dry air) |
+| 26 | `H2O_MEAN` | `h2o_dry_ppt` | mmol mol-1 (dry air) |
+| 27 | `RHO_A` | `rho_m_mean` | kg m-3 (moist air) |
+| 28 | `Q` | `q_mean` | kg kg-1 |
+| 29 | `CP` | `cp_mean` | J kg-1 K-1 |
+| 30 | `LAMBDA_V` | `lambda_v_mean` | J kg-1 |
+| 31 | `VAR_U` | `var_u` | m2 s-2 |
+| 32 | `VAR_V` | `var_v` | m2 s-2 |
+| 33 | `VAR_W` | `var_w` | m2 s-2 |
+| 34 | `VAR_TS` | `var_ts` | K2 |
+| 35 | `COV_U_W` | `cov_u_w` | m2 s-2 |
+| 36 | `COV_V_W` | `cov_v_w` | m2 s-2 |
+| 37 | `COV_W_TS` | `cov_w_ts` | K m s-1 |
+| 38 | `CO2_LAG` | `co2_lag_s` | s |
+| 39 | `CO2_LAG_OPT` | `co2_lag_opt_s` | s |
+| 40 | `CO2_LAG_DEFAULT` | `co2_lag_default_used` | 0/1 |
+| 41 | `H2O_LAG` | `h2o_lag_s` | s |
+| 42 | `H2O_LAG_OPT` | `h2o_lag_opt_s` | s |
+| 43 | `H2O_LAG_DEFAULT` | `h2o_lag_default_used` | 0/1 |
+| 44 | `H_L0` | `h_l0` | W m-2 |
+| 45 | `H` | `h` | W m-2 |
+| 46 | `FC_L0` | `fc_l0` | umol m-2 s-1 (scaled 1e6) |
+| 47 | `FC` | `fc` | umol m-2 s-1 (scaled 1e6) |
+| 48 | `LE_L0` | `le_l0` | W m-2 |
+| 49 | `LE` | `le` | W m-2 |
+| 50 | `E_L0` | `e_l0` | g m-2 s-1 (scaled 1e3) |
+| 51 | `E` | `e` | g m-2 s-1 (scaled 1e3) |
+| 52 | `WPL_APPLIED` | `wpl_applied` | 0/1 |
+| 53 | `SCF_CO2` | `scf_co2` | - |
+| 54 | `SCF_H2O` | `scf_h2o` | - |
+| 55 | `FC_SPEC` | `fc_spec` | umol m-2 s-1 (scaled 1e6) |
+| 56 | `LE_SPEC` | `le_spec` | W m-2 |
+| 57 | `E_SPEC` | `e_spec` | g m-2 s-1 (scaled 1e3) |
+| 58 | `SST_PCT` | `sst_pct` | % |
+| 59 | `SST_FLAG` | `sst_flag` | 0/1/2 |
+| 60 | `ITC_W` | `itc_w` | fraction |
+| 61 | `ITC_U` | `itc_u` | fraction |
+| 62 | `ITC_T` | `itc_t` | fraction (uses \|T*\|, see §20.5) |
 
 The sidecar `<stem>_units.csv` reproduces columns 1 and 4 of this table.
+
+Two blocks hold `na_value` unless the run used them. Columns 11, 22 and 23 record what air
+a closed-path conversion was done in (§7A). Columns 53-57 are the spectral block (§12A),
+and they sit **after** `WPL_APPLIED` deliberately: `FC`, `LE` and `E` above are the
+measured — attenuated — fluxes, and `FC_SPEC`, `LE_SPEC`, `E_SPEC` are those same fluxes
+multiplied by the factor printed beside them. Nothing in this table is corrected under an
+uncorrected name, or the other way round.
 
 ---
 
@@ -1023,8 +1228,14 @@ raises.** A step meets degeneracy by writing `nan` and logging.
 
 The refusal principle, stated once: miniflux refuses when continuing would produce a number
 that looks right and is not. That is the whole list — a fabricated pressure, an inferred
-timestamp format, an unsupported measure type, a closed-path input, an uncorrected flux under
+timestamp format, an unsupported measure type, a cell density with the cell state guessed
+from ambient, a spectral correction with a guessed time constant, an uncorrected flux under
 a corrected name. Everything else is reported as NaN and flagged.
+
+The principle cuts **both** ways, and §5.2.12 is where that is visible: a missing cell
+state is a refusal because it would produce a wrong number, while a cell state nothing
+needs is only a warning because it produces two columns of reading. Symmetry would be
+tidier and would be the wrong rule.
 
 ---
 
@@ -1052,9 +1263,18 @@ covariance in exact arithmetic.
 **20.4 Which gas measure types.** The WPL and micromet specs recommend molar density only;
 the flux-assembly spec recommends a two-branch `if` covering dry mixing ratios (which is what
 the bundled example configs actually use). **Decision: support `mixing_ratio` and
-`molar_density`; refuse `mole_fraction` (wet) and refuse closed-path input.** Two branches,
-one `if`, both example-config shapes readable, and the one branch that is genuinely a partial
-correction is left out with a message telling the user what to do instead.
+`molar_density`; refuse `mole_fraction` (wet).** Two branches, one `if`, both example-config
+shapes readable, and the one branch that is genuinely a partial correction is left out with a
+message telling the user what to do instead.
+
+*Amended:* this section originally also refused **closed-path input**, on the grounds that
+the only treatment miniflux had for it — an ambient density correction — is wrong in kind
+for a cell quantity. That reasoning was right and the conclusion no longer follows, because
+the correct treatment is now implemented: `cell.py` converts a cell density to a dry mixing
+ratio per sample (§7A, ALGORITHMS 2A), and the ambient correction still never runs on it.
+A closed-path analyser reporting a dry mixing ratio needs no conversion at all and is the
+recommended declaration. What remains refused is the case the original reasoning was really
+about: a cell density with **no declared cell state** (§5.2.12).
 
 **20.5 ITC temperature scale.** The parent and GEddySoft divide by a signed `T*`, which makes
 `ITC_T > 1` on every unstable period. **Decision: use `|T*|`**, per Foken's definition, and
@@ -1094,6 +1314,31 @@ Either a column or a user-written constant; otherwise the run refuses.
 17520 rows. **Decision: write the periods computed, nothing else.** Padding is a packaging
 step for a different pipeline.
 
+**20.13 Where the cell conversion lives, and where in the order.** Three options: fold it
+into `read.py` beside the affine unit maps (smallest diff, no new module, no new period
+keys); make it a step; or leave it to the caller. **Decision: a step, `cell.py`, running
+first.** `read.py`'s rule that every conversion it does is affine is a property worth
+keeping — this one is not affine, it needs a physical constant, and it has its own
+refusals and its own diagnostics (`T_CELL`, `P_CELL`, `N_CELL_CONV`), which is how a reader
+tells the two closed-path routes apart in the output. The cost is two more series keys in
+§1, both all-NaN when absent, which is the shape §1 already describes. Position: **before
+`despike`**, the only thing allowed there, because the MAD threshold should see the
+conserved quantity and because a spike in `t_cell` is screened nowhere else — converting
+first is what turns it into a spike the MAD test can catch. This departs from the parent,
+which despikes in raw analyser units, for the same reason §20.8 does.
+
+**20.14 Where the spectral factor is applied.** EddyPro corrects the **covariance** and
+then applies WPL on the result. **Decision: run after `wpl` and scale the reported flux,
+into new columns.** Two reasons. It cannot corrupt anything: `FC`, `LE`, `E` and every
+`_L0` keep exactly the values they had, and `FC_SPEC` is one visible multiplication away
+from `FC`. And for the case this exists for — a closed-path run, where no WPL ran and
+`FC = FC_L0` — the two orders are identical anyway. The divergence is real only for an
+**open-path molar-density** run with `[spectral]` on, where WPL is not linear in the
+covariance and the two orders differ; that is stated in ALGORITHMS 10A.6 and nowhere
+hidden. Publishing under separate names rather than correcting in place is the same
+decision as §12's withholding rule seen from the other side: a corrected number and an
+uncorrected one never share a column.
+
 ---
 
 ## 21. Test contract
@@ -1107,12 +1352,14 @@ step for a different pipeline.
 | `test_kernels_parity.py` | §3.8; skipped when numpy is absent |
 | `test_config.py` | every refusal in §5.2, and that every default in §6 round-trips |
 | `test_read.py` | both timestamp shapes, `closed` left/right boundary placement, duplicate handling, each `ReadError` |
+| `test_cell.py` | ALGORITHMS §2A: the round trip, the dilution divisor, that it is per sample, every degeneracy, and one synthetic half hour declared **both** ways through the whole pipeline |
+| `test_spectral.py` | ALGORITHMS §10A: both stability branches and their two check values, the monotonicities, the publishing rule, every guard |
 | `test_despike.py` | ALGORITHMS §14.2 |
 | `test_rotate.py` | ALGORITHMS §14.1, plus the negative-mean-u quadrant guard |
 | `test_lag.py` | ALGORITHMS §14.3, window inclusivity (`2I+1` evaluations), boundary fallback, truncation fill |
 | `test_detrend.py` | block mean stored and series untouched; linear detrend on a gapped series matches the closed form on the original index |
 | `test_flux.py` | ALGORITHMS §14.4, §14.7; the three temperature-unit conventions of §8.3 |
-| `test_wpl.py` | ALGORITHMS §14.5, §14.6; the `off`-but-owed refusal |
+| `test_wpl.py` | ALGORITHMS §14.5, §14.6; the `off`-but-owed refusal; that a closed-path gas is never owed one |
 | `test_qc.py` | the three flag bounds, non-finite -> flag 2, every ITC guard |
 | `test_pipeline.py` | the step order of §14, a synthetic end-to-end period, and that a raising step still produces a row |
 

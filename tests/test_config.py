@@ -147,6 +147,8 @@ class TestShippedDefaults(ConfigTestCase):
         self.assertEqual(self.cfg.variables.h2o, 'H2O')
         self.assertIsNone(self.cfg.variables.ta)      # empty means absent, not ''
         self.assertEqual(self.cfg.variables.p_air, 'Press')
+        self.assertIsNone(self.cfg.variables.t_cell)
+        self.assertIsNone(self.cfg.variables.p_cell)
 
     def test_units_and_gases(self):
         self.assertEqual(self.cfg.units.ts, 'K')
@@ -156,12 +158,30 @@ class TestShippedDefaults(ConfigTestCase):
         self.assertEqual(self.cfg.units.h2o, 'ppt')
         self.assertEqual(self.cfg.gases.co2_measure_type, 'mixing_ratio')
         self.assertEqual(self.cfg.gases.h2o_measure_type, 'mixing_ratio')
+        self.assertEqual(self.cfg.gases.analyser_path, 'open')
         self.assertEqual(self.cfg.gases.measure_type,
                          {'co2': 'mixing_ratio', 'h2o': 'mixing_ratio'})
+        self.assertEqual(self.cfg.gases.reported,
+                         {'co2': 'mixing_ratio', 'h2o': 'mixing_ratio'})
+        self.assertEqual(self.cfg.gases.convert_cell, ())
+        # The cell keys default to the LI-7200's own units, not to the canonical K/Pa the
+        # ambient ones default to: there is no safe default for a cell temperature, so the
+        # shipped one matches the instrument the key exists for.
+        self.assertEqual(self.cfg.units.t_cell, 'degC')
+        self.assertEqual(self.cfg.units.p_cell, 'kPa')
         self.assertEqual(self.cfg.units.convert, {
             'u': (1.0, 0.0), 'v': (1.0, 0.0), 'w': (1.0, 0.0),
             'ts': (1.0, 0.0), 'ta': (1.0, 0.0), 'p_air': (1.0, 0.0),
+            't_cell': (1.0, T0), 'p_cell': (1000.0, 0.0),
             'co2': (1e-6, 0.0), 'h2o': (1e-3, 0.0)})
+
+    def test_spectral_ships_off_and_declares_no_time_constant(self):
+        # The shipped default has to be inert: an enabled correction with a guessed tau
+        # would put a plausible few per cent on every flux of every user who switched the
+        # section on without reading it.
+        self.assertIs(self.cfg.spectral.enabled, False)
+        self.assertIsNone(self.cfg.spectral.co2_tau_s)
+        self.assertIsNone(self.cfg.spectral.h2o_tau_s)
 
     def test_steps(self):
         self.assertIs(self.cfg.despike.enabled, True)
@@ -453,6 +473,126 @@ class TestRefusal10Numpy(ConfigTestCase):
                          [])
 
 
+CLOSED_DENSITY = {'gases': {'analyser_path': 'closed',
+                            'co2_measure_type': 'molar_density',
+                            'h2o_measure_type': 'molar_density'},
+                  'units': {'co2': 'mmol/m3', 'h2o': 'mmol/m3'}}
+
+
+class TestRefusal12CellState(ConfigTestCase):
+    """5.2.12 -- a cell density is unusable without the cell's own state."""
+
+    def cells(self, **names):
+        extra = dict((name, dict(keys)) for name, keys in CLOSED_DENSITY.items())
+        extra.setdefault('variables', {}).update(names)
+        return extra
+
+    def test_a_closed_path_density_without_a_cell_state_is_refused(self):
+        message = self.refuse(self.cells(), '[variables]', 't_cell')
+        self.assertIn('ANALYSER CELL', message)
+        # The message has to say what to do instead, and the exact way out is the column
+        # the analyser already writes.
+        self.assertIn('CO2_DRY', message)
+
+    def test_half_a_cell_state_is_still_a_refusal(self):
+        self.refuse(self.cells(t_cell='T_CELL'), '[variables]', 'p_cell')
+        self.refuse(self.cells(p_cell='PRESS_CELL'), '[variables]', 't_cell')
+
+    def test_the_ambient_pressure_is_not_a_substitute_and_the_message_says_so(self):
+        message = self.refuse(self.cells(), '[variables]')
+        self.assertIn('not substituted', message)
+
+    def test_a_declared_cell_state_loads(self):
+        cfg = self.load(self.cells(t_cell='T_CELL', p_cell='PRESS_CELL'))
+        self.assertEqual(cfg.gases.convert_cell, ('co2', 'h2o'))
+        self.assertEqual(cfg.gases.measure_type,
+                         {'co2': 'mixing_ratio', 'h2o': 'mixing_ratio'})
+        self.assertEqual(cfg.gases.reported,
+                         {'co2': 'molar_density', 'h2o': 'molar_density'})
+
+    def test_an_open_path_density_needs_no_cell_and_stays_owed_wpl(self):
+        extra = dict((name, dict(keys)) for name, keys in CLOSED_DENSITY.items())
+        extra['gases']['analyser_path'] = 'open'
+        cfg = self.load(extra)
+        self.assertEqual(cfg.gases.convert_cell, ())
+        self.assertEqual(cfg.gases.measure_type,
+                         {'co2': 'molar_density', 'h2o': 'molar_density'})
+
+    def test_a_closed_path_dry_mixing_ratio_needs_no_cell_state(self):
+        # The recommended declaration: exact, and nothing to convert.
+        cfg = self.load({'gases': {'analyser_path': 'closed'}})
+        self.assertEqual(cfg.gases.convert_cell, ())
+        self.assertEqual(cfg.gases.measure_type,
+                         {'co2': 'mixing_ratio', 'h2o': 'mixing_ratio'})
+
+    def test_one_gas_may_be_a_cell_density_while_the_other_is_a_dry_ratio(self):
+        # An LI-7200 read as CO2_CONC + H2O_DRY. The water still supplies the dilution
+        # factor, as a moist fraction built from the dry ratio.
+        cfg = self.load({'gases': {'analyser_path': 'closed',
+                                   'co2_measure_type': 'molar_density'},
+                         'units': {'co2': 'mmol/m3'},
+                         'variables': {'t_cell': 'T_CELL', 'p_cell': 'PRESS_CELL'}})
+        self.assertEqual(cfg.gases.convert_cell, ('co2',))
+        self.assertEqual(cfg.gases.measure_type,
+                         {'co2': 'mixing_ratio', 'h2o': 'mixing_ratio'})
+
+    def test_a_cell_state_nothing_needs_is_warned_about_and_not_refused(self):
+        # Asymmetric on purpose: a missing cell state produces a wrong number, an unused
+        # one produces two columns of reading (CONTRACT 19).
+        logger = logging.getLogger('miniflux')
+        with _records(logger) as seen:
+            cfg = self.load({'variables': {'t_cell': 'T_CELL', 'p_cell': 'PRESS_CELL'}})
+        self.assertEqual(cfg.gases.convert_cell, ())
+        messages = [r.getMessage() for r in seen if r.levelno >= logging.WARNING]
+        self.assertTrue(any('t_cell' in m and 'not used' in m for m in messages), messages)
+
+    def test_an_unknown_analyser_path_is_refused(self):
+        self.refuse({'gases': {'analyser_path': 'closed_path'}},
+                    '[gases]', 'analyser_path', 'open | closed')
+
+    def test_the_cell_units_are_checked_like_any_other_scalar(self):
+        self.refuse({'units': {'t_cell': 'degF'}}, '[units]', 't_cell', 'unknown unit')
+        self.refuse({'units': {'p_cell': 'bar'}}, '[units]', 'p_cell', 'unknown unit')
+
+    def test_the_cell_state_is_not_a_canonical_variable(self):
+        # It enters no covariance and is consumed before despiking, so naming it in one of
+        # the per-variable lists would be a no-op that reads like a safeguard.
+        for section, key in (('despike', 'variables'), ('detrend', 'variables'),
+                             ('lag', 'scalars')):
+            self.refuse({section: {key: 'u,t_cell'}}, '[%s]' % section, 't_cell',
+                        'not a canonical variable')
+
+
+class TestRefusal13SpectralTimeConstant(ConfigTestCase):
+    """5.2.13 -- no time constant, no correction. miniflux does not guess a tube."""
+
+    def test_enabled_without_a_time_constant_is_refused(self):
+        message = self.refuse({'spectral': {'enabled': 'true'}},
+                              '[spectral]', 'co2_tau_s', '<not set>')
+        self.assertIn('ships no default', message)
+
+    def test_a_non_positive_time_constant_is_refused(self):
+        self.refuse({'spectral': {'enabled': 'true', 'co2_tau_s': '0.0',
+                                  'h2o_tau_s': '0.3'}}, '[spectral]', 'co2_tau_s')
+        self.refuse({'spectral': {'enabled': 'true', 'co2_tau_s': '0.3',
+                                  'h2o_tau_s': '-1'}}, '[spectral]', 'h2o_tau_s')
+
+    def test_both_gases_are_required_not_just_one(self):
+        self.refuse({'spectral': {'enabled': 'true', 'co2_tau_s': '0.3'}},
+                    '[spectral]', 'h2o_tau_s')
+
+    def test_a_disabled_section_needs_nothing(self):
+        cfg = self.load({'spectral': {'enabled': 'false'}})
+        self.assertIs(cfg.spectral.enabled, False)
+        self.assertIsNone(cfg.spectral.co2_tau_s)
+
+    def test_two_declared_time_constants_load(self):
+        cfg = self.load({'spectral': {'enabled': 'true', 'co2_tau_s': '0.13',
+                                      'h2o_tau_s': '0.40'}})
+        self.assertIs(cfg.spectral.enabled, True)
+        self.assertEqual((cfg.spectral.co2_tau_s, cfg.spectral.h2o_tau_s), (0.13, 0.40))
+
+
 class TestUnitConversions(ConfigTestCase):
     """CONTRACT 6.1, including the two mass-density rows and the rule that gates them."""
 
@@ -584,8 +724,10 @@ class TestTypingAndSyntax(ConfigTestCase):
     def test_an_unknown_key_or_section_is_refused(self):
         self.refuse({'period': {'avaraging_minutes': '10'}},
                     '[period]', 'avaraging_minutes', 'unknown key')
-        message = self.refuse({'spectral': {'method': 'ibrom'}}, '[spectral]')
+        message = self.refuse({'footprint': {'method': 'kl15'}}, '[footprint]')
         self.assertIn('unknown section', message)
+        self.refuse({'spectral': {'model': 'horst'}},
+                    '[spectral]', 'model', 'unknown key')
 
     def test_a_default_section_is_refused(self):
         try:

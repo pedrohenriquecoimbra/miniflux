@@ -282,6 +282,12 @@ def _flux_factor(measure_type, vd_mean):
 
     ``<Vd>`` is the period mean of the per-sample dry-air molar volume; evaluating
     ``Pd_mean/(R*Ta_mean)`` instead is a slightly different number (ALGORITHMS 9.1).
+
+    ``measure_type`` is the **effective** one, so a closed-path cell density that
+    ``cell.convert`` has already turned into a dry mixing ratio takes the ratio branch
+    and is multiplied by the AMBIENT dry-air molar density -- which is right: the
+    mixing ratio is conserved along the tube, so the moles of dry air it is a ratio of
+    are the ones passing the sonic.
     """
     if measure_type == 'molar_density':
         return 1.0

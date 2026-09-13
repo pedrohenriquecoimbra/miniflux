@@ -21,16 +21,25 @@ from .errors import ConfigError
 logger = logging.getLogger(__name__)
 
 CANONICAL = ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air')
+# The analyser cell's own state. Deliberately NOT canonical: it is an input to one
+# conversion and enters no covariance, so it may not be named in [despike] variables,
+# [detrend] variables, [lag] scalars or [qc] steady_state_pair. Despiking it after
+# cell.convert has run would be a no-op that reads like a safeguard.
+CELL = ('t_cell', 'p_cell')
 REQUIRED_COLUMNS = ('u', 'v', 'w', 'ts', 'co2', 'h2o')
 GASES = ('co2', 'h2o')
 MEASURE_TYPES = ('mixing_ratio', 'molar_density')
 MOLAR_MASS = {'co2': MCO2, 'h2o': MV}      # kg mol-1, for the mass-density units of 6.1
 
 # CONTRACT 6.1, x_canonical = a * x_file + b.
+TEMPERATURE_UNITS = {'K': (1.0, 0.0), 'degC': (1.0, T0)}
+PRESSURE_UNITS = {'Pa': (1.0, 0.0), 'hPa': (100.0, 0.0), 'kPa': (1000.0, 0.0)}
 SCALAR_UNITS = {
-    'ts': {'K': (1.0, 0.0), 'degC': (1.0, T0)},
-    'ta': {'K': (1.0, 0.0), 'degC': (1.0, T0)},
-    'p_air': {'Pa': (1.0, 0.0), 'hPa': (100.0, 0.0), 'kPa': (1000.0, 0.0)},
+    'ts': TEMPERATURE_UNITS,
+    'ta': TEMPERATURE_UNITS,
+    't_cell': TEMPERATURE_UNITS,
+    'p_air': PRESSURE_UNITS,
+    'p_cell': PRESSURE_UNITS,
 }
 MIXING_UNITS = {'ppm': 1e-6, 'umol/mol': 1e-6, 'ppt': 1e-3, 'mmol/mol': 1e-3}
 MOLAR_DENSITY_UNITS = {'mmol/m3': 1e-3, 'mol/m3': 1.0}
@@ -81,14 +90,23 @@ SPEC = (
         ('u', 'str', 'Ux'), ('v', 'str', 'Uy'), ('w', 'str', 'Uz'),
         ('ts', 'str', 'Ts'), ('co2', 'str', 'CO2'), ('h2o', 'str', 'H2O'),
         ('ta', 'str', ''), ('p_air', 'str', 'Press'),
+        ('t_cell', 'str', ''), ('p_cell', 'str', ''),
     )),
     ('units', (
         ('ts', 'str', 'K'), ('ta', 'str', 'K'), ('p_air', 'str', 'Pa'),
+        # The cell state defaults to what every closed-path analyser actually writes,
+        # not to the canonical K/Pa the other two default to: these two keys exist only
+        # for a closed-path run, and degC/kPa is the LI-7200's and the LI-7000's native
+        # output. There is no safe default here -- a cell temperature read as 25 K
+        # instead of 298 K is a factor of twelve on the gas -- so the shipped value is
+        # the one that matches the instrument the key was written for.
+        ('t_cell', 'str', 'degC'), ('p_cell', 'str', 'kPa'),
         ('co2', 'str', 'ppm'), ('h2o', 'str', 'ppt'),
     )),
     ('gases', (
         ('co2_measure_type', 'str', 'mixing_ratio'),
         ('h2o_measure_type', 'str', 'mixing_ratio'),
+        ('analyser_path', ('open', 'closed'), 'open'),
     )),
     ('despike', (
         ('enabled', 'bool', 'true'),
@@ -109,6 +127,11 @@ SPEC = (
     ('wpl', (
         ('enabled', ('auto', 'on', 'off'), 'auto'),
     )),
+    ('spectral', (
+        ('enabled', 'bool', 'false'),
+        ('co2_tau_s', 'float', ''),
+        ('h2o_tau_s', 'float', ''),
+    )),
     ('qc', (
         ('steady_state_pair', 'names', 'w,co2'),
         ('itc', 'bool', 'true'),
@@ -119,11 +142,14 @@ SPEC = (
     )),
 )
 
-# The only four keys that may be left empty, because for them "not set" says something the
-# program acts on: no measured air temperature, no pressure column, no declared displacement,
-# no constant pressure. Everywhere else an empty value is a slip of the keyboard.
+# The only keys that may be left empty, because for them "not set" says something the
+# program acts on: no measured air temperature, no pressure column, no declared
+# displacement, no constant pressure, no analyser cell state, no declared sensor time
+# constant. Everywhere else an empty value is a slip of the keyboard.
 OPTIONAL = (('site', 'displacement_height'), ('site', 'pressure_pa'),
-            ('variables', 'ta'), ('variables', 'p_air'))
+            ('variables', 'ta'), ('variables', 'p_air'),
+            ('variables', 't_cell'), ('variables', 'p_cell'),
+            ('spectral', 'co2_tau_s'), ('spectral', 'h2o_tau_s'))
 
 LAG_WINDOW_DEFAULTS = (('nominal_s', '0.0'), ('min_s', '-2.0'), ('max_s', '2.0'))
 BOOLEANS = {'true': True, 'yes': True, 'on': True, '1': True,
@@ -307,8 +333,24 @@ def _check_blanks(cfg):
 # --------------------------------------------------------------------------- derived
 
 def _derive_gases(cfg):
-    """cfg.gases.measure_type[gas] -- refusal 5.2.2 for anything but the two supported kinds."""
-    cfg.gases.measure_type = {}
+    """How each gas was reported, and what it will be by the time a flux is built.
+
+    Three attributes come out of this, and the difference between the first two is the
+    whole of miniflux's closed-path support:
+
+    * ``cfg.gases.reported[gas]`` -- the measure type as the file writes it (refusal
+      5.2.2 for anything but the two supported kinds);
+    * ``cfg.gases.convert_cell`` -- the gases ``cell.convert`` will rewrite, i.e. the
+      cell molar densities of a closed-path analyser;
+    * ``cfg.gases.measure_type[gas]`` -- the **effective** measure type, after that
+      rewrite. A converted gas is a dry mixing ratio here, which is what makes the flux
+      factor, the mean density and "is WPL owed?" all come out right in
+      ``flux.py`` and ``wpl.py`` without either module learning that a cell exists.
+
+    Resolving it once, here, is deliberate: a step may not mutate ``cfg``, and three
+    modules asking "was this converted?" at run time is three chances to disagree.
+    """
+    cfg.gases.reported = {}
     for gas in GASES:
         key = gas + '_measure_type'
         value = getattr(cfg.gases, key)
@@ -316,13 +358,19 @@ def _derive_gases(cfg):
             _fail('gases', key,
                   'miniflux supports mixing_ratio (dry) and molar_density only; '
                   'convert a wet mole fraction upstream (got %r)' % value)
-        cfg.gases.measure_type[gas] = value
+        cfg.gases.reported[gas] = value
+    closed = cfg.gases.analyser_path == 'closed'
+    cfg.gases.convert_cell = tuple(
+        gas for gas in GASES if closed and cfg.gases.reported[gas] == 'molar_density')
+    cfg.gases.measure_type = dict(
+        (gas, 'mixing_ratio' if gas in cfg.gases.convert_cell else cfg.gases.reported[gas])
+        for gas in GASES)
 
 
 def _derive_units(cfg):
     """cfg.units.convert[name] = (a, b) of CONTRACT 6.1; refusals 5.2.3 and the mass-density rule."""
     convert = {'u': (1.0, 0.0), 'v': (1.0, 0.0), 'w': (1.0, 0.0)}   # sonic wind is m s-1 already
-    for name in ('ts', 'ta', 'p_air'):
+    for name in ('ts', 'ta', 'p_air') + CELL:
         table = SCALAR_UNITS[name]
         unit = getattr(cfg.units, name)
         if unit not in table:
@@ -331,7 +379,10 @@ def _derive_units(cfg):
         convert[name] = table[unit]
     for gas in GASES:
         unit = getattr(cfg.units, gas)
-        measure = cfg.gases.measure_type[gas]
+        # The declared unit is checked against how the file REPORTS the gas, never
+        # against the effective type: a cell molar density is written in mmol/m3 and is
+        # still a molar density on disk, whatever cell.convert will make of it.
+        measure = cfg.gases.reported[gas]
         if unit in MIXING_UNITS:
             _require_measure(gas, unit, measure, 'mixing_ratio', 'a dry mixing ratio')
             convert[gas] = (MIXING_UNITS[unit], 0.0)
@@ -480,6 +531,9 @@ def _validate(cfg):
         _fail('qc', 'steady_state_pair', 'expected exactly two canonical names, got %s'
               % (', '.join(cfg.qc.steady_state_pair) or 'nothing'))
 
+    _validate_cell(cfg)                                                  # 5.2.12
+    _validate_spectral(cfg)                                              # 5.2.13
+
     # Guards beyond 5.2: a step must never raise, so anything that would only fail later,
     # deep in read.py or write.py, is refused here instead.
     if cfg.files.header_line < 1:
@@ -498,6 +552,60 @@ def _validate(cfg):
         _fail('output', 'float_format',
               '%r is not a format that accepts one float; write something like %%.6g'
               % cfg.output.float_format)
+
+
+def _validate_cell(cfg):
+    """Refusal 5.2.12: a cell density cannot be converted without the cell's own state.
+
+    The two directions are not symmetric, and that is the point. A gas reported as a
+    molar density in a closed-path cell is *unusable* without a cell temperature and a
+    cell pressure -- the ambient ones describe air that has not been through the tube or
+    the pump, and substituting them produces a number that looks entirely right and is
+    not (CONTRACT 19). So that is a refusal. A cell state declared where nothing needs
+    one costs the user two columns of reading and no wrong number, so that is a warning.
+    """
+    missing = [name for name in CELL if getattr(cfg.variables, name) is None]
+    if cfg.gases.convert_cell and missing:
+        _fail('variables', missing[0],
+              'is required: %s reported as a molar density by a closed-path analyser '
+              '([gases] analyser_path = closed) is a density in the ANALYSER CELL, and '
+              'converting it to a dry mixing ratio needs the cell temperature and the '
+              'cell pressure the sample was measured at. The ambient ones describe air '
+              'that has not been down the tube and are not substituted. Name the cell '
+              'columns, or declare the gas as the dry mixing ratio the analyser also '
+              'reports (CO2_DRY / H2O_DRY on an LI-7200), which needs no cell state at '
+              'all and is exact.' % ', '.join(cfg.gases.convert_cell))
+    if not cfg.gases.convert_cell and len(missing) < len(CELL):
+        declared = [name for name in CELL if getattr(cfg.variables, name) is not None]
+        logger.warning('[variables] %s is declared but no gas needs a cell conversion '
+                       '(analyser_path = %s, measure types %s); the column is read and '
+                       'not used', ', '.join(declared), cfg.gases.analyser_path,
+                       ', '.join('%s=%s' % item
+                                 for item in sorted(cfg.gases.reported.items())))
+
+
+def _validate_spectral(cfg):
+    """Refusal 5.2.13: no time constant, no correction. miniflux does not guess a tube.
+
+    The whole correction is one number per gas, and it is a property of *this* tube at
+    *this* flow rate -- not of the analyser model, and certainly not of a default. A
+    shipped value would put a plausible few per cent on every flux of every user who
+    switched the section on without reading it, which is the one thing this program is
+    built not to do.
+    """
+    if not cfg.spectral.enabled:
+        return
+    for gas in GASES:
+        key = gas + '_tau_s'
+        tau = getattr(cfg.spectral, key)
+        if tau is None or tau <= 0:
+            _fail('spectral', key,
+                  'must be a positive first-order time constant in seconds when '
+                  '[spectral] enabled = true, got %s. miniflux ships no default: the '
+                  'value belongs to this tube at this flow rate and has to be measured '
+                  '(a cospectral ratio against the sonic temperature) or taken from the '
+                  "instrument's documented response." % ('<not set>' if tau is None
+                                                         else repr(tau)))
 
 
 def _resolve_numpy(cfg):

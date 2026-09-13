@@ -2,7 +2,13 @@
 
 This is the only module that knows about files, quoting, NA tokens and units as written.
 Everything below it sees the canonical vocabulary of CONTRACT section 2 in canonical
-units: nine series keys that always exist, always ``array('d')``, always the same length.
+units: eleven series keys that always exist, always ``array('d')``, always the same
+length.
+
+Every conversion done here is **affine** (``x = a*x_file + b``). The one non-affine
+conversion miniflux performs -- a closed-path cell molar density into a dry mixing ratio
+-- is a pipeline step of its own (``cell.py``), not a unit, which is why the cell
+temperature and cell pressure arrive downstream as series rather than being consumed here.
 
 Two of the rules here change the numbers rather than the plumbing (ALGORITHMS section 2):
 a timestamp is parsed by explicit field extraction and **never** inferred, because a format
@@ -27,7 +33,7 @@ from .errors import ReadError
 
 logger = logging.getLogger(__name__)
 
-SERIES = ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air')
+SERIES = ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air', 't_cell', 'p_cell')
 EPOCH = datetime(1970, 1, 1)   # every period boundary is anchored here, as pandas' floor/ceil is
 US = 1000000                   # microseconds per second; period arithmetic is done in whole ones
 RATE_TOLERANCE = 0.01          # relative gap between observed and configured rate worth a warning
@@ -108,6 +114,31 @@ def _instant(fields, rest, text, shape):
         raise ReadError('timestamp %r is not a real instant: %s' % (text, exc))
 
 
+def _stamp(token, kind, cache):
+    """``parse_timestamp``, paying for the date and the time of day once per second.
+
+    token, kind: as ``parse_timestamp`` takes them. cache: one dict per file, keyed by the
+    part of the token up to the fraction. At 20 Hz a row differs from the row before it in
+    its fractional digits alone, so the instant of the whole second is parsed once and the
+    twenty samples that share it each only place their own microseconds in a copy of it.
+    Every token the cache does not recognise in full goes to ``parse_timestamp``, which
+    owns every refusal.
+    """
+    cut = 19 if kind == 'iso' else 14
+    head = token[:cut]
+    base = cache.get(head)
+    if base is not None:
+        rest = token[cut:]
+        if not rest:
+            return base
+        digits = rest[1:]
+        if rest[0] == '.' and 0 < len(digits) <= 6 and digits.isdigit():
+            return base.replace(microsecond=int(digits.ljust(6, '0')))
+    stamp = parse_timestamp(token, kind)
+    cache[head] = stamp.replace(microsecond=0)
+    return stamp
+
+
 def _shape_error(text, shape):
     return ('timestamp %r does not have the shape declared by [timestamp] format, which is '
             '%s; miniflux parses timestamps and never infers their format' % (text, shape))
@@ -121,7 +152,7 @@ def periods(cfg, counters=None):
     Reads every file matched by ``[files] input_glob`` **in timestamp order**
     (ALGORITHMS 2.3), converts each declared column with its affine map from CONTRACT
     6.1, and closes a period as soon as a sample belonging to a later one arrives.
-    Writes all nine series keys, ``t``, and the meta keys ``period_start``,
+    Writes all ten series keys, ``t``, and the meta keys ``period_start``,
     ``period_end``, ``n_in``, ``n_dup``, ``freq_hz``.
 
     counters: an optional dict this function adds facts about the stream to, because a
@@ -129,9 +160,9 @@ def periods(cfg, counters=None):
     is incremented once per period dropped for holding fewer than
     ``[period] min_samples`` samples.
 
-    Guarantees to everything downstream: ``t`` is non-decreasing, the nine series have
-    equal length, an absent column is all-NaN (``ta``) or the declared constant
-    (``p_air``), and the units are canonical.
+    Guarantees to everything downstream: ``t`` is non-decreasing, the ten series have
+    equal length, an absent column is all-NaN (``ta``, ``t_cell``, ``p_cell``) or the
+    declared constant (``p_air``), and the units are canonical.
     """
     paths = glob.glob(cfg.files.input_glob)
     if not paths:
@@ -142,7 +173,14 @@ def periods(cfg, counters=None):
     acc = None
     for path in _ordered(paths, cfg):
         for stamp, values, lineno in _samples(path, cfg, declared):
-            start, end = period_bounds(stamp, cfg.period.seconds, cfg.period.closed)
+            # The cut is the most expensive thing in this loop and at 20 Hz it lands on
+            # the period already open 35999 times out of 36000, so it is computed only for
+            # the sample that leaves it -- `_holds` is period_bounds' own rule, read as a
+            # test instead of a division.
+            if acc is not None and _holds(acc, stamp, cfg.period.closed):
+                start, end = acc['start'], acc['end']
+            else:
+                start, end = period_bounds(stamp, cfg.period.seconds, cfg.period.closed)
             if acc is None:
                 acc = _open(start, end, declared)
             elif end != acc['end']:
@@ -176,6 +214,18 @@ def periods(cfg, counters=None):
         period = _close(acc, cfg, declared, counters)
         if period is not None:
             yield period
+
+
+def _holds(acc, t, closed):
+    """Whether one instant falls in the period already open.
+
+    Exactly ``period_bounds(t, ...) == (acc['start'], acc['end'])``, written the other way
+    round: the period is ``(start, end]`` when ``closed = 'right'`` and ``[start, end)``
+    when it is 'left' (ALGORITHMS 0.1), which is one comparison instead of the floor.
+    """
+    if closed == 'right':
+        return acc['start'] < t <= acc['end']
+    return acc['start'] <= t < acc['end']
 
 
 def _ordered(paths, cfg):
@@ -234,7 +284,7 @@ def _open(start, end, declared):
 
 
 def _close(acc, cfg, declared, counters=None):
-    """Finish one period: the nine arrays and the five meta keys, or None when it is short."""
+    """Finish one period: the ten arrays and the five meta keys, or None when it is short."""
     label = '%s .. %s' % (acc['start'], acc['end'])
     n = len(acc['t'])
     if acc['n_dup']:
@@ -258,9 +308,10 @@ def _close(acc, cfg, declared, counters=None):
     for name in SERIES:
         if name in period:
             continue
-        # Only `ta` and `p_air` can be absent; config refuses a run without the other six.
-        # A missing pressure column is the one constant miniflux fills, and only because
-        # the user wrote the number themselves in [site] pressure_pa.
+        # Only `ta`, `p_air` and the two cell columns can be absent; config refuses a run
+        # without the other six, and refuses a closed-path cell density without the cell
+        # state. A missing pressure column is the one constant miniflux fills, and only
+        # because the user wrote the number themselves in [site] pressure_pa.
         fill = cfg.site.pressure_pa if name == 'p_air' else kernels.NAN
         period[name] = kernels.new(n, fill)
     return period
@@ -269,7 +320,11 @@ def _close(acc, cfg, declared, counters=None):
 # --------------------------------------------------------------------------- one file
 
 def _rows(path, cfg):
-    """Yield ``(lineno, row)`` for one file, as ``csv.reader`` splits it.
+    """Yield ``(lineno, row)`` for one file, split exactly as ``csv.reader`` splits it.
+
+    Most lines of a 20 Hz file are numbers and carry no quote character at all, and those
+    ``str.split`` cuts in half the time the reader takes; ``_split`` takes them, hands the
+    rest back to ``csv.reader``, and never guesses (CONTRACT 7.1).
 
     Every way a file can refuse to be read -- it is a directory, the permissions deny it,
     the bytes are not the declared encoding, ``[files] encoding`` names no codec -- is an
@@ -280,15 +335,61 @@ def _rows(path, cfg):
         handle = open(path, 'r', encoding=cfg.files.encoding, newline='')
     except (OSError, LookupError) as exc:
         raise ReadError(_unreadable(path, cfg, exc))
+    delimiter = cfg.files.delimiter
+    quotechar = cfg.files.quotechar
     try:
-        reader = csv.reader(handle, delimiter=cfg.files.delimiter,
-                            quotechar=cfg.files.quotechar)
-        for lineno, row in enumerate(reader, 1):
-            yield lineno, row
+        lineno = 0
+        for line in handle:
+            lineno += 1
+            first = lineno
+            row = _split(line.rstrip('\r\n'), delimiter, quotechar)
+            if row is None:
+                taken = [line]
+                row = next(csv.reader(_record(taken, handle), delimiter=delimiter,
+                                      quotechar=quotechar), [])
+                lineno += len(taken) - 1   # a quoted field may hold the newline it read
+            yield first, row
     except (OSError, UnicodeDecodeError, csv.Error) as exc:
         raise ReadError(_unreadable(path, cfg, exc))
     finally:
         handle.close()
+
+
+def _split(text, delimiter, quotechar):
+    """One line as ``csv.reader`` would split it, or None when the reader itself is needed.
+
+    text: one line with its terminator already off. Returns a list of str, or None for
+    every quote shape not proved equivalent to a plain split -- a field holding the
+    delimiter somewhere other than the first column, a doubled quote, a quote inside an
+    unquoted field, a field whose quote never closes on this line. Those are rare, legal
+    and easy to get subtly wrong, so this refuses to be clever about them and the reader
+    parses them instead.
+    """
+    if quotechar not in text:
+        return text.split(delimiter) if text else []
+    if text[0] == quotechar and text.count(quotechar) == 2:
+        # One quoted field in front of unquoted ones: a TOA5 timestamp, and the only
+        # quoting an eddy-covariance logger writes on a data row.
+        head, _quote, rest = text[1:].partition(quotechar)
+        if not rest:
+            return [head]
+        if rest[0] == delimiter:
+            row = rest[1:].split(delimiter)
+            row.insert(0, head)
+            return row
+    return None
+
+
+def _record(taken, handle):
+    """The lines of one csv record: the one that opened it, then any it still needs.
+
+    A quoted field may hold a newline, which makes a record longer than a line. Every line
+    the reader pulls lands in ``taken``, which is how the caller keeps its line count.
+    """
+    yield taken[0]
+    for line in handle:
+        taken.append(line)
+        yield line
 
 
 def _unreadable(path, cfg, exc):
@@ -305,6 +406,10 @@ def _samples(path, cfg, declared):
     plan = None
     first = last = None
     count = 0
+    seconds = {}
+    # A set for the per-token test, which runs once per declared column of every row; the
+    # configured tuple keeps its order for the message that names it.
+    na_values = frozenset(cfg.files.na_values)
     for lineno, row in _rows(path, cfg):
         if lineno == cfg.files.header_line:
             plan = _plan(row, cfg, declared, path)
@@ -317,11 +422,25 @@ def _samples(path, cfg, declared):
                             'configuration reads column %d'
                             % (path, lineno, len(row), width))
         try:
-            stamp = parse_timestamp(row[time_index], cfg.timestamp.format)
+            stamp = _stamp(row[time_index], cfg.timestamp.format, seconds)
         except ReadError as exc:
             raise ReadError('%s line %d: %s' % (path, lineno, exc))
-        values = [_number(row[index], cfg.files.na_values, path, lineno, column) * a + b
-                  for index, a, b, column in entries]
+        values = []
+        for index, a, b, column in entries:
+            token = row[index].strip()
+            if token in na_values:
+                values.append(kernels.NAN)
+                continue
+            try:
+                # float() also accepts PEP 515 digit grouping, so '1_0' would arrive as
+                # 10.0. No logger writes that; a token carrying one is corruption, and
+                # reading it as a number is the "looks right and is not" case CONTRACT 19
+                # refuses.
+                if '_' in token:
+                    raise ValueError(token)
+                values.append(float(token) * a + b)
+            except ValueError:
+                _refuse_number(row[index], cfg, path, lineno, column)
         count += 1
         if first is None:
             first = stamp
@@ -367,22 +486,11 @@ def _plan(header, cfg, declared, path):
     return time_index, tuple(entries), width
 
 
-def _number(text, na_values, path, lineno, column):
-    """One data token as a float; an NA token becomes NaN, anything else is refused."""
-    token = text.strip()
-    if token in na_values:
-        return kernels.NAN
-    try:
-        # float() also accepts PEP 515 digit grouping, so '1_0' would arrive as 10.0. No
-        # logger writes that; a token carrying one is corruption, and reading it as a
-        # number is the "looks right and is not" case CONTRACT 19 refuses.
-        if '_' in token:
-            raise ValueError(token)
-        return float(token)
-    except ValueError:
-        raise ReadError('%s line %d: column %r holds %r, which is neither a number nor one '
-                        'of [files] na_values = %s'
-                        % (path, lineno, column, text, ','.join(na_values)))
+def _refuse_number(text, cfg, path, lineno, column):
+    """Refuse one token that is neither a number nor an NA token. Never returns."""
+    raise ReadError('%s line %d: column %r holds %r, which is neither a number nor one '
+                    'of [files] na_values = %s'
+                    % (path, lineno, column, text, ','.join(cfg.files.na_values)))
 
 
 def _check_rate(path, cfg, count, first, last):

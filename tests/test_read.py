@@ -6,6 +6,7 @@ in mg/m3, whose H2O is in g/m3, whose sonic temperature is in degC and whose pre
 in kPa -- the four unit rows that only this module ever applies.
 """
 
+import csv
 import logging
 import math
 import os
@@ -265,6 +266,36 @@ class NumericTimestampTest(ReadTestCase):
         self.assertEqual(period['meta']['period_end'], datetime(2022, 5, 13, 0, 0))
 
 
+class SecondsCacheTest(ReadTestCase):
+    """The samples of one second share the instant of that second and nothing else."""
+
+    def test_every_fraction_of_one_second_keeps_its_own_microseconds(self):
+        rows = [ROW % '2025-09-08 19:32:00',
+                ROW % '2025-09-08 19:32:00.000001',
+                ROW % '2025-09-08 19:32:00.05',
+                ROW % '2025-09-08 19:32:00.5',
+                ROW % '2025-09-08 19:32:01']
+        period = self.read_one(rows)
+        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32, 0),
+                                       datetime(2025, 9, 8, 19, 32, 0, 1),
+                                       datetime(2025, 9, 8, 19, 32, 0, 50000),
+                                       datetime(2025, 9, 8, 19, 32, 0, 500000),
+                                       datetime(2025, 9, 8, 19, 32, 1)])
+
+    def test_a_bad_fraction_is_still_refused_after_a_good_one_in_the_same_second(self):
+        self.write_csv([ROW % '2025-09-08 19:32:00.05',
+                        ROW % '2025-09-08 19:32:00.1234567'])
+        with self.assertRaises(ReadError) as caught:
+            list(read.periods(self.load()))
+        self.assertIn('fractional digits', str(caught.exception))
+
+    def test_whitespace_around_a_timestamp_is_tolerated_row_after_row(self):
+        rows = [ROW % ' 2025-09-08 19:32:00.05 ', ROW % ' 2025-09-08 19:32:01.05 ']
+        period = self.read_one(rows)
+        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32, 0, 50000),
+                                       datetime(2025, 9, 8, 19, 32, 1, 50000)])
+
+
 class ClosedTest(ReadTestCase):
     """The one sample that sits exactly on the boundary, in both directions."""
 
@@ -358,6 +389,88 @@ class FileOrderTest(ReadTestCase):
         found = list(read.periods(self.load()))
         self.assertEqual([p['meta']['period_end'] for p in found],
                          [datetime(2025, 9, 8, 19, 0), datetime(2025, 9, 8, 20, 0)])
+
+
+class QuotingTest(ReadTestCase):
+    """CONTRACT 7.1: a line is split exactly as ``csv.reader`` splits it.
+
+    Most lines of a 20 Hz file carry no quote at all and are cut with ``str.split``; the
+    shapes below are the ones where that would be wrong, and each of them is handed back
+    to the reader for that record alone. One quoted line in the middle of a file is legal,
+    so the choice is made per line and never per file.
+    """
+
+    # A text column in front of the numbers, so that a line split the wrong way shifts
+    # every value read after it rather than falling off the end unnoticed.
+    NOTE = 'TIMESTAMP,Note,' + HEADER.split(',', 1)[1]
+
+    def test_a_quoted_timestamp_in_front_of_unquoted_numbers(self):
+        # What a TOA5 logger writes, and the only quoting on a data row of the real files.
+        rows = ['"2025-09-08 19:32:00",1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '"2025-09-08 19:32:00.05",4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        period = self.read_one(rows)
+        self.assertEqual(list(period['u']), [1.0, 4.0])
+        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32),
+                                       datetime(2025, 9, 8, 19, 32, 0, 50000)])
+
+    def test_one_quoted_line_in_the_middle_of_an_unquoted_file(self):
+        rows = ['2025-09-08 19:32:00,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '"2025-09-08 19:32:00.05","4.0",2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.10,7.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        period = self.read_one(rows)
+        self.assertEqual(list(period['u']), [1.0, 4.0, 7.0])
+
+    def test_a_quoted_field_holding_the_delimiter_is_still_one_field(self):
+        # The naive split would shift every column after it by one; the reader takes it.
+        rows = ['2025-09-08 19:32:00,"a,b",1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '"2025-09-08 19:32:00.05","c,d",4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        period = self.read_one(rows, header=self.NOTE)
+        self.assertEqual(list(period['u']), [1.0, 4.0])
+
+    def test_a_doubled_quote_inside_a_quoted_field(self):
+        rows = ['2025-09-08 19:32:00,"say, ""hi""",1.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        period = self.read_one(rows, header=self.NOTE)
+        self.assertEqual(list(period['u']), [1.0])
+
+    def test_a_quoted_field_holding_a_newline_is_one_row(self):
+        # The record runs past the end of its first line, and the line count runs with it:
+        # the row after it is refused by the line it is actually on.
+        rows = ['2025-09-08 19:32:00,"two\nlines",1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.05,plain,4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        period = self.read_one(rows, header=self.NOTE)
+        self.assertEqual(list(period['u']), [1.0, 4.0])
+
+    def test_a_line_after_a_record_holding_a_newline_is_refused_by_its_own_line(self):
+        rows = ['2025-09-08 19:32:00,"two\nlines",1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.05,plain,4.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.10,plain,ten,2.0,3.0,300.0,400.0,10.0,101325.0']
+        self.write_csv(rows, header=self.NOTE)
+        with self.assertRaises(ReadError) as caught:
+            list(read.periods(self.load()))
+        self.assertIn('line 5', str(caught.exception))
+
+    def test_every_shape_is_split_the_way_csv_reader_splits_it(self):
+        # The equivalence the fast path rests on, asserted against csv.reader itself.
+        lines = ['a,b,c',
+                 '"a","b","c"',
+                 'plain,"quoted",plain',
+                 '"holds,the,delimiter",b',
+                 '"holds ""a"" quote",b',
+                 'an "inner" quote,b',
+                 '"never closes,b',
+                 '"",a',
+                 '"a",',
+                 ' "a",b',
+                 'a,"",b',
+                 '',
+                 'trailing,fields,']
+        path = os.path.join(self.directory, 'shapes.csv')
+        with open(path, 'w', newline='') as handle:
+            handle.write('\n'.join(lines) + '\n')
+        cfg = self.load()
+        with open(path, newline='') as handle:
+            expected = list(csv.reader(handle))
+        self.assertEqual([row for _lineno, row in read._rows(path, cfg)], expected)
 
 
 class NaValueTest(ReadTestCase):

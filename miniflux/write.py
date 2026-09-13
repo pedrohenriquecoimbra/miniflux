@@ -38,6 +38,7 @@ COLUMNS = [
     ('N_SPIKE_TS', 'n_spike_ts', 'samples'),
     ('N_SPIKE_CO2', 'n_spike_co2', 'samples'),
     ('N_SPIKE_H2O', 'n_spike_h2o', 'samples'),
+    ('N_CELL_CONV', 'n_cell_converted', 'samples'),
     ('WS', 'wind_speed', 'm s-1'),
     ('WD', 'wind_dir', 'deg from north'),
     ('THETA', 'theta', 'deg'),
@@ -48,6 +49,10 @@ COLUMNS = [
     ('TA', 'ta_mean', 'K'),
     ('T_SONIC', 'ts_mean', 'K'),
     ('PA', 'p_air_mean', 'Pa'),
+    # The analyser cell's own state, not ambient: it is what the closed-path conversion
+    # was done at, and na_value on every open-path run.
+    ('T_CELL', 't_cell_mean', 'K'),
+    ('P_CELL', 'p_cell_mean', 'Pa'),
     ('RH', 'rh_mean', '%'),
     ('CO2_MEAN', 'co2_dry_ppm', 'umol mol-1 (dry air)'),
     ('H2O_MEAN', 'h2o_dry_ppt', 'mmol mol-1 (dry air)'),
@@ -77,6 +82,16 @@ COLUMNS = [
     ('E_L0', 'e_l0', 'g m-2 s-1'),
     ('E', 'e', 'g m-2 s-1'),
     ('WPL_APPLIED', 'wpl_applied', '0/1'),
+    # The spectral block. FC/LE/E above are the measured fluxes and carry the analyser's
+    # high-frequency loss; these four are the Horst (1997) first-order estimate of what
+    # that loss was and what the flux would be without it. Separate columns, never a
+    # rewrite, so nothing in this table is corrected under an uncorrected name or the
+    # other way round.
+    ('SCF_CO2', 'scf_co2', '-'),
+    ('SCF_H2O', 'scf_h2o', '-'),
+    ('FC_SPEC', 'fc_spec', 'umol m-2 s-1'),
+    ('LE_SPEC', 'le_spec', 'W m-2'),
+    ('E_SPEC', 'e_spec', 'g m-2 s-1'),
     ('SST_PCT', 'sst_pct', '%'),
     ('SST_FLAG', 'sst_flag', '0/1/2'),
     ('ITC_W', 'itc_w', 'fraction'),
@@ -93,7 +108,7 @@ _TIMESTAMPS = frozenset(('period_start', 'period_end'))
 # Counts and flags: written as plain integers, never through float_format, so a sample count
 # is never rendered as 1.2e+04.
 _INTEGERS = frozenset(('n_in', 'n_dup', 'n_spike_u', 'n_spike_v', 'n_spike_w', 'n_spike_ts',
-                       'n_spike_co2', 'n_spike_h2o', 'sst_flag'))
+                       'n_spike_co2', 'n_spike_h2o', 'n_cell_converted', 'sst_flag'))
 
 # Booleans, published as 0/1.
 _FLAGS = frozenset(('co2_lag_default_used', 'h2o_lag_default_used', 'wpl_applied'))
@@ -107,6 +122,8 @@ _SCALE = {
     'fc': 1e6,
     'e_l0': 1e3,           # kg m-2 s-1 -> g m-2 s-1
     'e': 1e3,
+    'fc_spec': 1e6,        # the spectral block publishes in the same units as FC / E
+    'e_spec': 1e3,
 }
 
 

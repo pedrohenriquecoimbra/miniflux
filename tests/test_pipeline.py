@@ -1,7 +1,7 @@
 """CONTRACT sections 14, 15, 16 and 18.
 
 What this file pins: the normative step order, one synthetic period carried end to end, the
-exact 54-column table with its header and its units sidecar, the na policy, the published
+exact 62-column table with its header and its units sidecar, the na policy, the published
 unit scaling, and the rule that a step which raises still produces a written row.
 
 The physics of each step is pinned by that step's own test file; here the assertions are
@@ -18,22 +18,24 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-from miniflux import (cli, config, despike, detrend, flux, kernels, lag, pipeline, qc,
-                      rotate, wpl, write)
+from miniflux import (cell, cli, config, despike, detrend, flux, kernels, lag, pipeline,
+                      qc, rotate, spectral, wpl, write)
 
 # CONTRACT section 14, verbatim.
-EXPECTED_STEPS = ['despike', 'rotate', 'lag', 'thermodynamics', 'detrend', 'moments',
-                  'assemble', 'wpl', 'qc']
+EXPECTED_STEPS = ['cell', 'despike', 'rotate', 'lag', 'thermodynamics', 'detrend',
+                  'moments', 'assemble', 'wpl', 'spectral', 'qc']
 
 # CONTRACT section 18, verbatim, in order.
 EXPECTED_COLUMNS = [
     'TIMESTAMP_START', 'TIMESTAMP_END', 'N_IN', 'N_DUP', 'N_SPIKE_U', 'N_SPIKE_V',
-    'N_SPIKE_W', 'N_SPIKE_TS', 'N_SPIKE_CO2', 'N_SPIKE_H2O', 'WS', 'WD', 'THETA', 'PHI',
-    'USTAR', 'MO_LENGTH', 'ZL', 'TA', 'T_SONIC', 'PA', 'RH', 'CO2_MEAN', 'H2O_MEAN',
+    'N_SPIKE_W', 'N_SPIKE_TS', 'N_SPIKE_CO2', 'N_SPIKE_H2O', 'N_CELL_CONV', 'WS', 'WD',
+    'THETA', 'PHI', 'USTAR', 'MO_LENGTH', 'ZL', 'TA', 'T_SONIC', 'PA', 'T_CELL', 'P_CELL',
+    'RH', 'CO2_MEAN', 'H2O_MEAN',
     'RHO_A', 'Q', 'CP', 'LAMBDA_V', 'VAR_U', 'VAR_V', 'VAR_W', 'VAR_TS', 'COV_U_W',
     'COV_V_W', 'COV_W_TS', 'CO2_LAG', 'CO2_LAG_OPT', 'CO2_LAG_DEFAULT', 'H2O_LAG',
     'H2O_LAG_OPT', 'H2O_LAG_DEFAULT', 'H_L0', 'H', 'FC_L0', 'FC', 'LE_L0', 'LE', 'E_L0',
-    'E', 'WPL_APPLIED', 'SST_PCT', 'SST_FLAG', 'ITC_W', 'ITC_U', 'ITC_T',
+    'E', 'WPL_APPLIED', 'SCF_CO2', 'SCF_H2O', 'FC_SPEC', 'LE_SPEC', 'E_SPEC',
+    'SST_PCT', 'SST_FLAG', 'ITC_W', 'ITC_U', 'ITC_T',
 ]
 
 CONFIG_TEXT = """
@@ -133,22 +135,32 @@ class StepOrderTest(unittest.TestCase):
         self.assertEqual([name for name, _step in pipeline.STEPS], EXPECTED_STEPS)
 
     def test_each_name_is_bound_to_the_contract_function(self):
-        expected = [despike.despike, rotate.rotate, lag.apply_lags, flux.thermodynamics,
-                    detrend.detrend, flux.moments, flux.assemble, wpl.correct, qc.quality]
+        expected = [cell.convert, despike.despike, rotate.rotate, lag.apply_lags,
+                    flux.thermodynamics, detrend.detrend, flux.moments, flux.assemble,
+                    wpl.correct, spectral.correct, qc.quality]
         self.assertEqual([step for _name, step in pipeline.STEPS], expected)
 
-    def test_despike_is_first_and_qc_is_last(self):
+    def test_cell_is_first_and_qc_is_last(self):
         # Stated separately because these two are the positions a refactor moves first: the
-        # MAD threshold must see raw values, and the ITC test needs the z/L assemble writes.
-        self.assertEqual(pipeline.STEPS[0][0], 'despike')
+        # cell conversion has to precede the MAD threshold so the threshold sees a
+        # conserved quantity, and the ITC test needs the z/L assemble writes.
+        self.assertEqual(pipeline.STEPS[0][0], 'cell')
         self.assertEqual(pipeline.STEPS[-1][0], 'qc')
+
+    def test_despike_precedes_every_step_that_reshapes_a_distribution(self):
+        names = [name for name, _step in pipeline.STEPS]
+        self.assertLess(names.index('despike'), names.index('rotate'))
+        self.assertLess(names.index('despike'), names.index('detrend'))
+        # cell.convert is the one thing allowed before it, and only because the cell state
+        # it divides out is not screened anywhere else.
+        self.assertEqual(names.index('despike'), names.index('cell') + 1)
 
 
 class ColumnTableTest(unittest.TestCase):
     """CONTRACT section 18: the exact table, in order."""
 
-    def test_fifty_four_columns_in_order(self):
-        self.assertEqual(len(write.COLUMNS), 54)
+    def test_sixty_two_columns_in_order(self):
+        self.assertEqual(len(write.COLUMNS), 62)
         self.assertEqual([name for name, _key, _unit in write.COLUMNS], EXPECTED_COLUMNS)
 
     def test_every_entry_is_name_key_unit(self):
@@ -191,7 +203,7 @@ class WriterTest(unittest.TestCase):
         with write.Writer(self.path, self.cfg) as writer:
             writer.write(period)
         _header, rows = read_table(self.path)
-        self.assertEqual(rows[0], ['-9999'] * 54)
+        self.assertEqual(rows[0], ['-9999'] * 62)
 
     def test_published_unit_scaling_happens_here(self):
         # meta is SI; the table is in the units of section 18.
@@ -246,7 +258,7 @@ class EndToEndTest(unittest.TestCase):
         header, rows = read_table(self.path)
         self.assertEqual(header, EXPECTED_COLUMNS)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(len(rows[0]), 54)
+        self.assertEqual(len(rows[0]), 62)
         return dict(zip(header, rows[0]))
 
     def test_synthetic_period_produces_one_complete_row(self):
@@ -287,8 +299,8 @@ class EndToEndTest(unittest.TestCase):
         def explode(period, cfg):
             raise ZeroDivisionError('synthetic failure inside a step')
 
-        # rotate is position 1: despike has run, everything after it has not.
-        pipeline.STEPS[1] = ('rotate', explode)
+        # rotate is position 2: cell and despike have run, everything after them has not.
+        pipeline.STEPS[2] = ('rotate', explode)
         with self.assertLogs('miniflux', level='ERROR') as captured:
             period = pipeline.run_period(synthetic_period(n=300), self.cfg)
         self.assertIn('step rotate failed', '\n'.join(captured.output))

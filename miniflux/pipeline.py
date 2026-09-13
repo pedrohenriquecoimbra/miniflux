@@ -1,6 +1,6 @@
 """Apply the steps to every period, in the one order that is physically defensible.
 
-``STEPS`` is the whole program: read one period, push it through nine functions, hand the
+``STEPS`` is the whole program: read one period, push it through eleven functions, hand the
 result to the writer. Adding a processing stage to miniflux means writing a
 ``step(period, cfg) -> period`` function and putting its name in this list; there is no
 registry and nothing else to update (CONTRACT section 1.1).
@@ -10,14 +10,21 @@ The order below is normative -- see the comment on each line for what breaks if 
 
 import logging
 
-from . import despike, detrend, flux, lag, qc, read, rotate, wpl
+from . import cell, despike, detrend, flux, lag, qc, read, rotate, spectral, wpl
 
 logger = logging.getLogger(__name__)
 
 #: ``(name, function)`` in execution order; the name is what a failure is reported under.
 STEPS = [
-    # First, because the median/MAD threshold has to see raw values: rotation and detrending
-    # both reshape the distribution the spike test is calibrated against.
+    # Before despike, and it is the only thing that goes before it. A closed-path cell
+    # density carries the cell's own temperature and pressure fluctuations, which are not
+    # gas signal; converting first means the MAD test sees the conserved quantity, and
+    # means a spike in T_CELL -- which nothing else screens -- is caught as the spike it
+    # makes in the gas. A no-op for every open-path run.
+    ('cell', cell.convert),
+    # First of the turbulence steps, because the median/MAD threshold has to see raw
+    # values: rotation and detrending both reshape the distribution the spike test is
+    # calibrated against.
     ('despike', despike.despike),
     # Before lag, because the covariance the lag search maximises is taken on the rotated w.
     ('rotate', rotate.rotate),
@@ -33,6 +40,10 @@ STEPS = [
     # Before wpl, because WPL consumes the Schotanus-corrected H, not H_L0.
     ('assemble', flux.assemble),
     ('wpl', wpl.correct),
+    # After wpl, because it scales the REPORTED fluxes rather than the covariance, and so
+    # publishes a factor whose effect on the table is one multiplication a reader can
+    # check (CONTRACT section 20.14).
+    ('spectral', spectral.correct),
     # Last, because the ITC test needs z/L, which assemble creates. Run earlier it would
     # silently grade the period against the neutral wind model.
     ('qc', qc.quality),
@@ -80,6 +91,7 @@ def run(cfg, writer=None, limit=None):
     for one in loggers:
         one.addFilter(counter)
     try:
+        _warn_attenuated(cfg)
         # read.py counts the periods it drops straight into `summary`: they are never
         # yielded, and the warning it also logs does not exist at log_level = ERROR.
         for period in read.periods(cfg, summary):
@@ -95,6 +107,23 @@ def run(cfg, writer=None, limit=None):
         for one in loggers:
             one.removeFilter(counter)
     return summary
+
+
+def _warn_attenuated(cfg):
+    """Say once, per run, that a closed-path table with no spectral correction is low.
+
+    This is the largest known bias in those numbers and it is one-signed, so it is not a
+    caveat for the documentation alone -- a reader who has only the log and the table has
+    to be able to see it. Once per run rather than once per period: it is a property of
+    the configuration, and 48 copies of it would be noise the real warnings hide behind.
+    """
+    if cfg.gases.analyser_path == 'closed' and not cfg.spectral.enabled:
+        logger.warning(
+            'the analyser is closed-path and [spectral] enabled = false: FC, LE and E in '
+            'this table are ATTENUATED by the tube and are underestimates, typically by a '
+            'few per cent to tens of per cent depending on tube, flow and measurement '
+            'height. H is not affected (the sonic does not sample through the tube). See '
+            'ALGORITHMS.md section 10A.')
 
 
 def _label(period):

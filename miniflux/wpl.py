@@ -15,6 +15,16 @@ Every quantity this module needs is a scalar that an earlier step has already pu
 ``period['meta']``. It computes no mean and no covariance of its own, and that is
 deliberate -- see the landmine note in :func:`_apply`.
 
+**A closed-path gas is never given this correction, and that is the correct answer
+rather than a missing feature.** Webb's derivation is about the expansion and the
+dilution of *ambient* air at the sampling point; the air an LI-7200 measures has been
+through a tube and a pump, so the fluctuations this equation would remove are the ones
+the cell has already damped or imposed. The closed-path treatment is the per-sample
+conversion to a dry mixing ratio in ``cell.py`` instead, after which the gas is
+conserved and owes nothing. Nothing in this module tests for a cell: ``config.py``
+resolves such a gas's effective measure type to ``mixing_ratio``, and the
+``molar_density`` branches below simply never see it (ALGORITHMS 10.1).
+
 See ALGORITHMS.md section 10 and CONTRACT.md section 12.
 """
 
@@ -49,7 +59,10 @@ def correct(period, cfg):
     ``wpl_applied`` [bool], and ``wt`` [K m s-1] whenever the correction runs.
 
     A gas reported as a molar density is owed the correction; a dry mixing ratio is per
-    mole of dry air, hence already conserved, and owes none. When a gas is owed one and
+    mole of dry air, hence already conserved, and owes none -- whether it was reported
+    that way or converted from a cell density by ``cell.py``, which is why this reads
+    ``cfg.gases.measure_type`` (the effective type) and not ``cfg.gases.reported``. When
+    a gas is owed one and
     `enabled = off`, its corrected key is left absent: `write.py` emits `na_value` and no
     uncorrected number leaves the program wearing a corrected name.
 

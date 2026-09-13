@@ -256,6 +256,39 @@ class DecisionTable(unittest.TestCase):
         self.assertGreater(meta['le'], LE_L0)    # the water still gets Eq. 25
 
 
+class ClosedPathIsNeverOwed(unittest.TestCase):
+    """ALGORITHMS 10.1 and 2A.5: an ambient correction is wrong in kind for a cell.
+
+    `wpl.py` contains no test for a cell, and that is the design: it reads the EFFECTIVE
+    measure type, which `config.py` resolved to `mixing_ratio` for any gas `cell.convert`
+    rewrote. These two pin the consequence at this module's own boundary, so a change that
+    made `wpl.py` consult `cfg.gases.reported` instead would fail here.
+    """
+
+    def test_a_converted_cell_density_reaches_the_nothing_owed_branch(self):
+        # What config.load hands over for a closed-path molar-density run: `reported` says
+        # molar_density, `measure_type` says mixing_ratio, and only the latter is read.
+        cfg = _cfg(enabled='auto', co2='mixing_ratio', h2o='mixing_ratio')
+        cfg.gases.reported = {'co2': 'molar_density', 'h2o': 'molar_density'}
+        cfg.gases.analyser_path = 'closed'
+        cfg.gases.convert_cell = ('co2', 'h2o')
+        period, _ = _period()
+        wpl.correct(period, cfg)
+        meta = period['meta']
+        self.assertFalse(meta['wpl_applied'])
+        self.assertEqual(meta['fc'], FC_L0)
+        self.assertEqual(meta['le'], LE_L0)
+        self.assertNotIn('wt', meta)
+
+    def test_the_same_gas_declared_open_path_is_a_different_number(self):
+        # The size of the mistake [gases] analyser_path exists to prevent: on this parcel
+        # the ambient correction moves FC by about half of itself.
+        period, _ = _period()
+        wpl.correct(period, _cfg(co2='molar_density', h2o='molar_density'))
+        self.assertTrue(period['meta']['wpl_applied'])
+        self.assertGreater(abs(period['meta']['fc'] / FC_L0 - 1.0), 0.4)
+
+
 class OffButOwed(unittest.TestCase):
     """CONTRACT 12 and 19: an uncorrected number never wears a corrected name."""
 

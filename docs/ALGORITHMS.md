@@ -32,12 +32,22 @@ on each one. Two consequences, both binding:
 `tests/` pins these values, and each test carries the arithmetic in a comment:
 `tests/test_flux.py` holds §8.3's three temperature conventions, the §8.4 pieces (`es`,
 `cp_d`, `cp_v`, `lambda_v`) and §14.7's Schotanus contrast; `tests/test_wpl.py` holds
-§10.8 and §14.6, in both of the parcel states §10.8 discusses. A restamp here that the
-suite does not already agree with is a restamp that has not been checked.
+§10.8 and §14.6, in both of the parcel states §10.8 discusses; `tests/test_cell.py` holds
+§2A's round trip and its per-sample property; `tests/test_spectral.py` holds §10A.2's two
+check values and both stability branches. A restamp here that the suite does not already
+agree with is a restamp that has not been checked.
 
-The one value printed here that is **not** of this kind says so in place: §9.3's
-`H_L0 / H_EddyPro = 1.0387` is labelled *measured*, comes from a run on the bundled sample
-against another program, and no formula in this document reproduces it.
+The values printed here that are **not** of this kind each say so in place, and they are:
+
+* §9.3's `H_L0 / H_EddyPro = 1.0387`, *measured* on the bundled sample against another
+  program;
+* §2A.8's agreement between the two closed-path declarations, and §10A.1's 10.2 %
+  attenuation, both *measured* on the bundled FR-Gri day — the first against the
+  instrument's own arithmetic, the second against EddyPro through the parent;
+* §10A.4's `tau` table, which is §10A.2 evaluated over that day's 48 wind speeds and so is
+  reproducible only with the data in hand.
+
+Everything else stands on the formula above it.
 
 ---
 
@@ -212,6 +222,141 @@ In particular, **miniflux never fabricates an air pressure**. The parent substit
 99767.5 Pa for a missing pressure column and then produces finite WPL numbers from an
 invented pressure. A constant pressure may be used, but only if the user writes the number
 into the configuration themselves, and it is echoed in the log.
+
+---
+
+## 2A. Stage 1b — the closed-path cell conversion (Ibrom et al. 2007)
+
+**Citation.** Ibrom, A., Dellwik, E., Larsen, S. E., Pilegaard, K. (2007). On the use of
+the Webb-Pearman-Leuning theory for closed-path eddy correlation measurements. *Tellus B*
+59, 937-946.
+
+Lettered rather than numbered because it is a stage not every run has, and renumbering
+§§3-15 would break every `ALGORITHMS §N` reference in the code. It runs **first**, before
+despiking, and is a no-op for every open-path run.
+
+### 2A.1 What a closed-path analyser actually measures
+
+An LI-7200 does not measure the air at the tower. It draws air down a tube into a cell the
+instrument has warmed and the pump has dropped in pressure. Measured over the 48 half hours
+of the bundled FR-Gri day (medians, `T_CELL` / `P_CELL` against `TA` / `PA`):
+
+    cell      293.2 K    99.29 kPa
+    ambient   290.1 K   100.65 kPa        cell is +3.5 K (up to +7.6) and -1.33 kPa
+
+Everything the analyser reports is a property of *that* air:
+
+| what it reports | what the number is | conserved? |
+|---|---|---|
+| `CO2_DRY`, `H2O_DRY` | mixing ratio per mole of **dry** air, in the cell | **yes** |
+| `CO2`, `H2O` | mole fraction of **moist** cell air | no (dilution) |
+| `CO2_CONC`, `H2O_CONC` | molar density **in the cell** | no (expansion + dilution) |
+| `CO2_MASS`, `H2O_MASS` | mass density in the cell | no (same) |
+
+A dry mixing ratio is conserved along the tube: warming the sample, dropping its pressure
+and letting water in or out changes none of it, because it is counted per mole of dry air
+and the dry air is what came in. That is the whole reason analysers report one.
+
+### 2A.2 The clean case: declare the dry mixing ratio
+
+**If the file carries `CO2_DRY` / `H2O_DRY`, declare those, and this stage does nothing at
+all.** No cell state is read, no conversion is done, no density correction is owed, and
+the answer is exact rather than reconstructed. This is the recommended way to run a
+closed-path analyser, and `examples/fr_gri_closedpath_dry.ini` is it.
+
+### 2A.3 The conversion, when only the density is in the file
+
+    V_cell  = R * T_cell / P_cell                      [m3 mol-1]
+    chi_h2o = n_h2o * V_cell                           [mol mol-1 of moist cell air]
+    r_gas   = n_gas * V_cell / (1 - chi_h2o)           [mol mol-1 of DRY air]
+
+`n_gas * V_cell` is the sample's mole fraction; dividing by `1 - chi_h2o` re-expresses it
+per mole of dry air. When the water is itself reported as a dry mixing ratio `r_h2o`
+(reading an LI-7200 as `CO2_CONC` + `H2O_DRY`), the divisor is built from that instead,
+`chi_h2o = r_h2o / (1 + r_h2o)`; it is a *moist* fraction either way. Applied to the water
+itself the formula reduces to `r_h2o = chi_h2o / (1 - chi_h2o)`, which is the same
+statement.
+
+Dropping the `1 - chi_h2o` leaves a moist mole fraction wearing a dry name: on the FR-Gri
+parcel that is 1 %, which is the size of a whole day's CO2 signal.
+
+**Per sample, never on the means.** It is precisely the fluctuations of `T_cell`, `P_cell`
+and `chi_h2o` that carry the spurious part of the density signal; the same conversion
+applied to a block-averaged period removes exactly none of it and produces a correction
+indistinguishable from no correction. The two effects are coupled — a warmer sample has a
+larger `V_cell`, which raises the numerator *and* `chi_h2o` in the denominator — so the
+per-sample ratio is not simply proportional to `T_cell`.
+
+### 2A.4 Cell state or nothing
+
+`T_cell` and `P_cell` must be declared, and **the ambient ones are not a fallback**. That
+is a refusal (CONTRACT 5.2.12), not a warning, and after the missing pressure it is the
+strongest one in the program. The difference is not a matter of degree: the ambient state
+describes air that has not been through the tube or the pump. On the FR-Gri day the two
+substitutions push the same way — the cell is warmer *and* at lower pressure — so
+
+    V_ambient / V_cell  =  (Ta/T_cell) * (P_cell/Pa)
+
+is **2.6 % from 1 at the median and 4.0 % at the worst half hour**, and that lands whole on
+every gas flux of that period. It would look entirely right.
+
+### 2A.5 Why no ambient WPL follows, and why that is the answer
+
+Once the gas is a dry mixing ratio it is conserved, so there is nothing for Webb's equation
+to remove. That is the *correct* treatment and not a missing feature, and it is worth
+stating flatly because it is the part a reader assumes is a bug:
+
+> **Ambient WPL is never applied to a closed-path gas.**
+
+Webb, Pearman & Leuning derive the correction for the expansion and dilution of *ambient*
+air at the sampling point. The temperature and humidity fluctuations inside a cell at the
+end of a tube are not those fluctuations — the tube and the cell have damped some of them
+and imposed others — so applying the ambient correction to a cell quantity is wrong **in
+kind**, not merely in magnitude. It would describe air that never existed.
+
+The magnitude, measured on the synthetic parcel of `tests/test_cell.py`: declare the same
+cell densities as open-path ambient ones, let WPL run, and FC moves by **-15.3 %** and LE
+by **+0.8 %**. Both are entirely plausible-looking numbers, which is the point.
+
+Nothing in `wpl.py` or `flux.py` tests for a cell. `config.py` resolves a converted gas's
+**effective** `measure_type` to `mixing_ratio` once, at load time, and the flux factor
+(§9.1), the mean densities (§8.2) and "is a density correction owed?" (§10.1) all read
+that one word. A conversion therefore retires the correction by itself.
+
+### 2A.6 Where it sits, and why before despiking
+
+`cell` is the only step allowed to run before `despike`, for two reasons:
+
+* the MAD threshold should see the conserved quantity. A cell density carries the cell's
+  own temperature and pressure fluctuations, which are not gas signal and widen the
+  distribution the threshold is calibrated against;
+* a spike in `T_cell` is screened **nowhere else** in miniflux. Converting first turns it
+  into a spike in the gas, where the MAD test catches it.
+
+Everything else stays where §14 puts it: the conversion changes the values, not the shape,
+so the lag search, the covariances and the means are unaffected in kind.
+
+### 2A.7 What this does *not* fix
+
+Nothing here touches the frequency response. A closed-path flux is still attenuated in the
+tube and is still an **underestimate** — see §10A, and the warning the run logs once.
+
+### 2A.8 Verification against the instrument
+
+Over the 36000 samples of one FR-Gri half hour, converting `CO2_CONC` / `H2O_CONC` through
+§2A.3 and comparing with the `CO2_DRY` / `H2O_DRY` the same analyser wrote:
+
+    CO2_DRY   converted/reported - 1 :  mean +0.0194 %  sd 0.0239 %  range -0.10 .. +0.12 %
+    H2O_DRY   converted/reported - 1 :  mean +0.0194 %  sd 0.0239 %  range -0.10 .. +0.12 %
+
+The two agree to five decimal places *with each other*, which puts the whole residual in
+`V_cell = R T_cell / P_cell` — the analyser's internal cell state against the one it logs
+— and none of it in the dilution algebra. Carried through the pipeline over the 48 half
+hours of 2022-05-14, the CO2 flux from the two declarations agrees to **+0.033 % on
+average (median +0.024 %, worst 0.49 %)** across the 43 periods with
+`|FC| >= 1 µmol m-2 s-1`; LE and E to **+0.015 %** (worst 0.44 %). On synthetic data,
+where the two shapes are built from one another exactly, the agreement is **2e-16
+relative** — floating-point rounding and nothing else.
 
 ---
 
@@ -947,14 +1092,23 @@ constraint that the mean dry-air flux through the surface is zero.
 
 | how the gas was reported | correction owed |
 |---|---|
-| molar density (mol m-3) | **full** — thermal + dilution |
+| **ambient** molar density (mol m-3), i.e. open path | **full** — thermal + dilution |
 | dry mixing ratio (per mole of dry air) | **none** |
+| **cell** molar density, i.e. closed path | **none** — §2A converts it first; see below |
 | wet mole fraction | dilution only — *not implemented in miniflux*, see §13 |
 
 A dry mixing ratio is per mole of dry air, which is what makes it conserved; correcting it
 for dry-air fluctuations again subtracts the same effect twice. miniflux runs the WPL block
 only when at least one of CO2 / H2O is a molar density; otherwise the reported fluxes are
 exact copies of the `_L0` fluxes.
+
+**A closed-path gas is never given this correction** (§2A.5). Webb's derivation is about
+ambient air at the sampling point; a cell at the end of a tube has already damped some of
+those fluctuations and imposed others, so the ambient correction applied to a cell quantity
+is wrong in kind. The closed-path treatment is the per-sample conversion of §2A instead,
+after which the gas is conserved and owes nothing. `wpl.py` contains no test for a cell:
+`config.py` has already resolved such a gas's **effective** measure type to
+`mixing_ratio`, so the `molar_density` branches simply never see it.
 
 If a gas *is* owed a correction and WPL is switched off, **no reported flux is written for
 it at all** — `FC` is left missing while `FC_L0` is kept. An uncorrected number must never
@@ -1081,6 +1235,133 @@ got wrong.
 Rule of thumb worth asserting in a test: by day the CO2 correction is tens of percent to
 about one times the flux. **If your WPL term comes out at a few percent of FC, you have
 almost certainly used `cov(w,ts)` for `wT`, or a detrended (near-zero) mean density.**
+
+---
+
+## 10A. Stage 9b — first-order low-pass attenuation (Horst 1997)
+
+**Citation.** Horst, T. W. (1997). A simple formula for attenuation of eddy fluxes measured
+with first-order-response scalar sensors. *Boundary-Layer Meteorol.* 82, 219-233. Eq. 11,
+with the peak frequency of his Eqs. 8 and 10.
+
+**Default: off.** Lettered for the same reason as §2A.
+
+### 10A.1 The bias this is about, stated loudly
+
+A tube, a finite optical path, a sensor separation and a finite sensor response all
+low-pass the gas signal. Whatever fraction of the flux lives above the resulting cut-off
+is simply **missing from the covariance**. The error is one-signed:
+
+> **A closed-path FC or LE from miniflux with `[spectral] enabled = false` is an
+> UNDERESTIMATE — typically a few per cent to tens of per cent, depending on tube, flow
+> and measurement height.**
+
+This is the largest known bias in a miniflux gas flux. On the bundled FR-Gri sample the
+parent's full multi-term analytic method measures it at **10.2 % for both LE and CO2**
+against EddyPro. `H` is not affected: the sonic does not sample through the tube.
+
+A run whose analyser is closed-path and whose spectral section is off logs that sentence
+once, at `WARNING`, so a reader who has only the log and the table can still see it.
+
+### 10A.2 The model
+
+Horst treats the analyser as one first-order system with time constant `tau` and
+integrates its transfer function against a similarity cospectrum. The integral has a closed
+form, which is why this is forty lines and not four hundred:
+
+    A   = 1 / (1 + (2*pi*nm*tau*u/z)**alpha)        the attenuated fraction, 0 < A <= 1
+    SCF = 1/A = 1 + (2*pi*nm*tau*u/z)**alpha        the recovery factor, >= 1
+
+with `u` the period's mean wind speed [m s-1] and `z` the measurement height above the
+displacement, `z - d` [m] — the same height §9.4 puts under `z/L`. The cospectral shape
+enters through two constants that depend only on stability:
+
+| | `nm` | `alpha` |
+|---|---|---|
+| `z/L <= 0` | `0.085` | `7/8` |
+| `z/L >  0` | `2.0 - 1.915 / (1 + 0.5 z/L)` | `1` |
+
+`2.0 - 1.915 = 0.085` exactly, so the **peak frequency is continuous** at `z/L = 0` and
+only the exponent steps; the factor itself therefore does jump there, and a port should
+check the two facts separately rather than reading the jump as a bug. A stable period
+loses more, because its cospectrum peaks at higher natural frequency and more of it sits
+inside the roll-off.
+
+Check value, on the FR-Gri geometry (`u = 2`, `z - d = 1.9`, `z/L = -0.5`, `tau = 0.13`):
+`SCF = 1.1013541`, i.e. a flux measured 9.2 % low. The same geometry at `z/L = +0.5` gives
+`SCF = 1.4023884`.
+
+### 10A.3 What it is not
+
+**This is a first-order approximation and NOT a substitute for an in-situ method.** It is
+not EddyPro's, and it is not `oneflux_preproc`'s. It knows nothing about:
+
+* tube sorption on the water channel, or its RH dependence (H2O attenuates more than CO2
+  in a tube, and by an amount that varies with humidity — here it can only be given a
+  larger `tau`, fixed for the run);
+* sensor separation, which on a short tower is often the largest single term;
+* the actual measured cospectra, which the in-situ methods fit a cut-off frequency to.
+
+What it gives is **one defensible number per period, from geometry the user declares**,
+instead of a silent zero.
+
+### 10A.4 miniflux does not guess `tau`
+
+`[spectral] co2_tau_s` and `h2o_tau_s` have **no default** and the run is refused if the
+section is enabled without them (CONTRACT 5.2.13). The time constant belongs to *this*
+tube at *this* flow rate, not to the analyser model; a shipped value would put a plausible
+few per cent on every flux of every user who switched the section on without reading it.
+
+Determine it from a cospectral ratio against the sonic temperature, from the instrument's
+documented response — or, pragmatically, by fitting the loss you already know you have.
+Worked on FR-Gri (`z - d = 1.9 m`, mean wind 0.73 m s-1 over the 48 half hours):
+
+| `tau` [s] | median `SCF` | median flux recovered |
+|---|---|---|
+| 0.13 | 1.048 | 4.5 % |
+| 0.30 | 1.099 | 9.0 % |
+| 0.35 | ~1.113 | ~10.2 % |
+| 0.40 | 1.127 | 11.3 % |
+
+So ~0.35 s is what reproduces the 10.2 % the parent's full method measures against EddyPro
+here — an order larger than the LI-7200's own declared 0.1 s response, because one
+first-order constant has to absorb the tube, the optical path and the 17 cm sensor
+separation as well. That gap is the honest measure of how much this model leaves out.
+
+### 10A.5 What it publishes, and the naming rule
+
+It **never rewrites a flux**. The factors and the scaled fluxes are their own columns
+beside the measured ones:
+
+    SCF_CO2, SCF_H2O                  the recovery factors [-], >= 1
+    FC_SPEC = FC * SCF_CO2            [µmol m-2 s-1]
+    E_SPEC  = E  * SCF_H2O            [g m-2 s-1]
+    LE_SPEC = LE * SCF_H2O            [W m-2]
+
+`FC`, `LE` and `E` stay exactly what they were — measured, and attenuated. No number in the
+table can be read as corrected when it is not, or the other way round. With the section
+off, all five columns are `na_value`: a correction that was not made is absent, not 1.0.
+
+`H` is deliberately not scaled. A gas time constant does not describe the sonic.
+
+### 10A.6 Order: it scales the reported flux, after WPL
+
+The step runs **after** `wpl`, so `FC_SPEC` is one multiplication away from `FC` and a
+reader can check it by hand. For a closed-path run — the case this exists for — that is
+unambiguous, because no WPL ran: `FC = FC_L0`.
+
+For an **open-path molar-density** run, EddyPro's order is the other one (correct the
+covariance, then apply WPL), and WPL is not linear in the covariance, so the two differ.
+The factor is applied where it is applied, and this paragraph is the whole of the caveat.
+
+### 10A.7 Guards
+
+* `wind_speed` or `z/L` non-finite, or `z - d <= 0` → the factor is `NaN` and a `WARNING`
+  says which. A correction is a measured quantity here; a missing one is reported missing.
+* `SCF > 2` → a `WARNING`. Above that, more than half the reported flux would come from
+  the model rather than from the data, and Horst's first-order form is derived for modest
+  attenuation. It is not clipped — clipping would invent a number — but it is not silent.
+* `u = 0` gives `SCF = 1` exactly: no wind, no advected eddies, nothing to attenuate.
 
 ---
 
@@ -1228,11 +1509,16 @@ after the flux step that creates `z_L`.
 
 Each line says what the omission costs the user.
 
-* **No spectral / frequency-response correction** (high- and low-pass transfer functions,
-  Moncrieff, Massman, Ibrom, Horst). Fluxes are underestimated by roughly 2-15 % depending
-  on measurement height, tube length and stability — most severely for LE on a closed-path
-  system and for any flux in stable, low-wind conditions. This is the single largest known
-  bias in a miniflux number and it is not estimated anywhere.
+* **No in-situ spectral / frequency-response correction** (empirical cut-off frequencies
+  fitted to measured cospectra, Moncrieff, Massman, Ibrom's low-pass method, RH-dependent
+  H2O attenuation, sensor separation, the high-pass block-average term). Fluxes are
+  underestimated by roughly 2-15 % depending on measurement height, tube length and
+  stability — most severely for LE on a closed-path system and for any flux in stable,
+  low-wind conditions. This is the single largest known bias in a miniflux gas flux.
+  What miniflux *does* offer is §10A: one first-order time constant per gas against an
+  analytic transfer function, off by default, published in its own columns and explicitly
+  labelled an approximation. It does not replace the methods above, and §10A.4 measures
+  the gap on the bundled sample.
 * **No planar fit and no triple rotation.** Double rotation over-rotates individual
   low-wind periods (it forces `<w> = 0` even when the true streamline is tilted), which a
   planar fit estimated once over weeks of data avoids; the cost is a period-to-period
@@ -1241,14 +1527,11 @@ Each line says what the omission costs the user.
   omitted because its third angle depends on `<v'w'>` and `<v'^2>-<w'^2>`, EddyPro guards it
   at `|psi| > 10 deg` and the reference implementation deliberately does not, so the two
   disagree on essentially every period with a large roll angle.
-* **No closed-path handling.** miniflux accepts open-path (ambient) analysers only. The
-  correct treatment of a closed-path cell is not a density correction at all but a per-sample
-  conversion to a dry mixing ratio in the cell, `r = n_gas * V_cell / (1 - chi_h2o)` with
-  `V_cell = R T_cell / P_cell` (Ibrom et al. 2007; EddyPro's route), which needs fast cell
-  temperature and pressure channels. Applying an ambient density correction to a cell
-  quantity is wrong in kind — the fluctuations it corrects for are the ones the cell has
-  already damped or imposed — so miniflux refuses closed-path input rather than producing a
-  plausible wrong number.
+* **No multi-instrument closed-path setups.** Closed-path analysers *are* accepted (§2A),
+  but `[gases] analyser_path` is one word for the run: miniflux is a one-instrument, one-
+  clock, one-file-series program, and a CO2 cell on one tube beside an open-path water
+  channel is two instruments with two lags and two frames of reference. Run them
+  separately, or use an engine built for it.
 * **No wet-mole-fraction gas input** (dilution-only WPL). A user whose analyser reports a
   wet mole fraction must convert to a dry mixing ratio or a molar density before the file
   reaches miniflux; using the wrong branch is a ~12 % error on FC.
@@ -1301,6 +1584,21 @@ Each line says what the omission costs the user.
    ratio of **1** that is **1.0654**, not 1.04; 1.04 is the Bowen = 1.70 period. Assert
    whichever you like, but assert it against the Bowen ratio you actually built.
 8. **numpy parity**: identical decisions, reductions within 1e-12 relative (§12).
+9. **Closed-path round trip** (§2A.3): take a dry mixing ratio, express it as the cell
+   molar density it would be reported as at a given `T_cell` / `P_cell`, convert it back —
+   the same number returns. Synthesise the density from the ratio, not the other way
+   round, so a shared algebra error would have to be made twice in opposite directions to
+   pass. Carried through the whole pipeline, the two declarations of one synthetic half
+   hour agree to `2e-16` relative; on the real FR-Gri half hours, to 0.03 % (§2A.8).
+10. **The dilution divisor is load-bearing**: dropping `1/(1 - chi_h2o)` leaves a moist
+    mole fraction under a dry name, ~1 % on an ordinary parcel.
+11. **The conversion is per sample**: two periods with the same *mean* cell temperature,
+    one steady and one swinging, must give different converted series — and the
+    sample-to-sample ratio must carry the dilution coupling of §2A.3, not just `T+/T-`.
+12. **Horst Eq. 11** (§10A.2): `SCF(u=2, z-d=1.9, z/L=-0.5, tau=0.13) = 1.1013541` and
+    `SCF(z/L=+0.5) = 1.4023884`; the peak frequency is continuous at `z/L = 0` while the
+    exponent is not; `SCF >= 1` everywhere; it rises with `tau` and with `u`, and falls
+    with height.
 
 ---
 
@@ -1315,9 +1613,12 @@ Each line says what the omission costs the user.
 * Foken, T., Göckede, M., Mauder, M., Mahrt, L., Amiro, B., Munger, W. (2004). Post-field
   data quality control. In *Handbook of Micrometeorology*, Springer, 181-208.
   doi:10.1007/1-4020-2265-4_9
+* Horst, T. W. (1997). A simple formula for attenuation of eddy fluxes measured with
+  first-order-response scalar sensors. *Boundary-Layer Meteorol.* 82, 219-233.
+  doi:10.1023/A:1000229130034 (§10A, Eq. 11 and the peak frequency of Eqs. 8 and 10)
 * Ibrom, A., Dellwik, E., Larsen, S. E., Pilegaard, K. (2007). On the use of the
   Webb-Pearman-Leuning theory for closed-path eddy correlation measurements.
-  *Tellus B* 59, 937-946. (cited for what miniflux does *not* do)
+  *Tellus B* 59, 937-946. (§2A, the cell conversion)
 * Mauder, M. et al. (2013). A strategy for quality and uncertainty assessment of long-term
   eddy-covariance measurements. *Agric. For. Meteorol.* 169, 122-135.
 * Moncrieff, J., Clement, R., Finnigan, J., Meyers, T. (2004). Averaging, detrending and
