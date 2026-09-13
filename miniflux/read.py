@@ -16,6 +16,11 @@ guessed from the first row of a 20 Hz stream discards the nineteen samples per s
 carry a fractional part; and ``closed`` decides which period a sample landing exactly on a
 boundary belongs to, which displaces the whole period by one sample if it is wrong.
 
+A sample clock is carried through this module as whole microseconds since ``EPOCH``, an
+exact int. That is everything the period cut, the duplicate test and the sample count ask
+of it, and the period dict keeps no per-sample time at all (CONTRACT 1.2): a datetime is
+built twice per period, for its two boundaries, instead of once per sample.
+
 Only this module raises :class:`ReadError`, and it refuses rather than guessing: a
 timestamp of an unsupported shape, a missing column, a short row, a token that is neither
 a number nor an NA token, an empty glob, a file that cannot be opened or decoded, and a
@@ -52,17 +57,33 @@ def period_bounds(t, seconds, closed):
     ``closed = 'right'`` and to the later one when ``closed = 'left'`` (ALGORITHMS 0.1).
     """
     width = int(round(seconds * US))          # whole microseconds, so the cut cannot drift
-    delta = t - EPOCH
-    elapsed = (delta.days * 86400 + delta.seconds) * US + delta.microseconds
+    start, end = _bounds(_elapsed(t), width, closed)
+    return _moment(start), _moment(end)
+
+
+def _bounds(key, width, closed):
+    """``period_bounds`` on the integer clock the stream is actually cut on.
+
+    key: one sample instant in whole microseconds since EPOCH. width: the averaging
+    interval in the same unit. closed: as above. Returns ``(start, end)``, both int.
+    """
     # Python's % is non-negative for a positive modulus, so this floors before 1970 too.
-    floor = elapsed - elapsed % width
+    floor = key - key % width
     if closed == 'right':
-        end = floor if floor == elapsed else floor + width
-        start = end - width
-    else:
-        start = floor
-        end = floor + width
-    return EPOCH + timedelta(microseconds=start), EPOCH + timedelta(microseconds=end)
+        end = floor if floor == key else floor + width
+        return end - width, end
+    return floor, floor + width
+
+
+def _elapsed(t):
+    """One datetime as whole microseconds since EPOCH. Returns int."""
+    delta = t - EPOCH
+    return (delta.days * 86400 + delta.seconds) * US + delta.microseconds
+
+
+def _moment(key):
+    """Whole microseconds since EPOCH back as a datetime. The inverse of ``_elapsed``."""
+    return EPOCH + timedelta(microseconds=key)
 
 
 # --------------------------------------------------------------------------- timestamps
@@ -114,29 +135,34 @@ def _instant(fields, rest, text, shape):
         raise ReadError('timestamp %r is not a real instant: %s' % (text, exc))
 
 
-def _stamp(token, kind, cache):
-    """``parse_timestamp``, paying for the date and the time of day once per second.
+def _key(token, kind, cut, seconds, fractions):
+    """One timestamp token as whole microseconds since EPOCH, built from two lookups.
 
-    token, kind: as ``parse_timestamp`` takes them. cache: one dict per file, keyed by the
-    part of the token up to the fraction. At 20 Hz a row differs from the row before it in
-    its fractional digits alone, so the instant of the whole second is parsed once and the
-    twenty samples that share it each only place their own microseconds in a copy of it.
-    Every token the cache does not recognise in full goes to ``parse_timestamp``, which
-    owns every refusal.
+    token, kind: as ``parse_timestamp`` takes them. cut: where the fraction starts, 19 for
+    'iso' and 14 for 'numeric'. seconds: one dict per file, the token up to the fraction ->
+    that whole second. fractions: one dict per file, the fraction as written -> its
+    microseconds. At 20 Hz ``fractions`` holds twenty entries however long the file is and
+    ``seconds`` one per second of stream, so almost every row is two hits and an addition
+    and the date, the time of day and the fraction are each parsed once.
+
+    Every token either dict does not recognise goes to ``parse_timestamp``, which owns
+    every refusal. A token carrying leading whitespace is one of them, always: ``cut``
+    then falls inside its own seconds field and the leftover starts with a digit rather
+    than a '.', which is the shape ``fractions`` refuses to learn, so a shifted slice can
+    never collide with a real fraction.
     """
-    cut = 19 if kind == 'iso' else 14
-    head = token[:cut]
-    base = cache.get(head)
+    base = seconds.get(token[:cut])
     if base is not None:
-        rest = token[cut:]
-        if not rest:
-            return base
-        digits = rest[1:]
-        if rest[0] == '.' and 0 < len(digits) <= 6 and digits.isdigit():
-            return base.replace(microsecond=int(digits.ljust(6, '0')))
+        micro = fractions.get(token[cut:])
+        if micro is not None:
+            return base + micro
     stamp = parse_timestamp(token, kind)
-    cache[head] = stamp.replace(microsecond=0)
-    return stamp
+    key = _elapsed(stamp)
+    seconds[token[:cut]] = key - stamp.microsecond
+    rest = token[cut:]
+    if not rest or rest[0] == '.':
+        fractions[rest] = stamp.microsecond
+    return key
 
 
 def _shape_error(text, shape):
@@ -152,17 +178,20 @@ def periods(cfg, counters=None):
     Reads every file matched by ``[files] input_glob`` **in timestamp order**
     (ALGORITHMS 2.3), converts each declared column with its affine map from CONTRACT
     6.1, and closes a period as soon as a sample belonging to a later one arrives.
-    Writes all ten series keys, ``t``, and the meta keys ``period_start``,
-    ``period_end``, ``n_in``, ``n_dup``, ``freq_hz``.
+    Writes all ten series keys and the meta keys ``period_start``, ``period_end``,
+    ``n_in``, ``n_dup``, ``freq_hz``. No per-sample time is written (CONTRACT 1.2): the
+    sample clock lives in this function as an integer key and leaves it as the two
+    boundaries of each period.
 
     counters: an optional dict this function adds facts about the stream to, because a
     period it drops is never yielded and a log record is not a number. ``skipped_short``
     is incremented once per period dropped for holding fewer than
     ``[period] min_samples`` samples.
 
-    Guarantees to everything downstream: ``t`` is non-decreasing, the ten series have
-    equal length, an absent column is all-NaN (``ta``, ``t_cell``, ``p_cell``) or the
-    declared constant (``p_air``), and the units are canonical.
+    Guarantees to everything downstream: the samples of a period are in strictly
+    increasing clock order, the ten series have equal length, an absent column is all-NaN
+    (``ta``, ``t_cell``, ``p_cell``) or the declared constant (``p_air``), and the units
+    are canonical.
     """
     paths = glob.glob(cfg.files.input_glob)
     if not paths:
@@ -170,17 +199,19 @@ def periods(cfg, counters=None):
                         % (cfg.files.input_glob, os.getcwd()))
     logger.info('reading %d file(s) matching %r', len(paths), cfg.files.input_glob)
     declared = _declared(cfg)
+    closed = cfg.period.closed
+    width = int(round(cfg.period.seconds * US))
     acc = None
     for path in _ordered(paths, cfg):
-        for stamp, values, lineno in _samples(path, cfg, declared):
+        for key, values, lineno in _samples(path, cfg, declared):
             # The cut is the most expensive thing in this loop and at 20 Hz it lands on
             # the period already open 35999 times out of 36000, so it is computed only for
-            # the sample that leaves it -- `_holds` is period_bounds' own rule, read as a
+            # the sample that leaves it -- `_holds` is `_bounds`' own rule, read as a
             # test instead of a division.
-            if acc is not None and _holds(acc, stamp, cfg.period.closed):
+            if acc is not None and _holds(acc, key, closed):
                 start, end = acc['start'], acc['end']
             else:
-                start, end = period_bounds(stamp, cfg.period.seconds, cfg.period.closed)
+                start, end = _bounds(key, width, closed)
             if acc is None:
                 acc = _open(start, end, declared)
             elif end != acc['end']:
@@ -196,18 +227,20 @@ def periods(cfg, counters=None):
                         'this is a clock that steps backwards inside a file or two files '
                         'that overlap -- sort the rows, or run the overlapping files '
                         'separately. miniflux will not silently drop them.'
-                        % (path, lineno, stamp, end, acc['end']))
+                        % (path, lineno, _moment(key), _moment(end),
+                           _moment(acc['end'])))
                 period = _close(acc, cfg, declared, counters)
                 if period is not None:
                     yield period
                 acc = _open(start, end, declared)
-            # Keeping only samples strictly later than the last one kept is what makes `t`
-            # non-decreasing downstream, and since it is non-decreasing, a repeat of any
+            # Keeping only samples strictly later than the last one kept is what puts the
+            # ten series in clock order, and since they are in clock order, a repeat of any
             # earlier instant can only be a repeat of this one: first wins, rest counted.
-            if acc['t'] and stamp <= acc['t'][-1]:
+            if key <= acc['last']:
                 acc['n_dup'] += 1
                 continue
-            acc['t'].append(stamp)
+            acc['last'] = key
+            acc['n'] += 1
             for column, value in zip(acc['columns'], values):
                 column.append(value)
     if acc is not None:
@@ -216,16 +249,16 @@ def periods(cfg, counters=None):
             yield period
 
 
-def _holds(acc, t, closed):
-    """Whether one instant falls in the period already open.
+def _holds(acc, key, closed):
+    """Whether one sample key falls in the period already open.
 
-    Exactly ``period_bounds(t, ...) == (acc['start'], acc['end'])``, written the other way
+    Exactly ``_bounds(key, ...) == (acc['start'], acc['end'])``, written the other way
     round: the period is ``(start, end]`` when ``closed = 'right'`` and ``[start, end)``
     when it is 'left' (ALGORITHMS 0.1), which is one comparison instead of the floor.
     """
     if closed == 'right':
-        return acc['start'] < t <= acc['end']
-    return acc['start'] <= t < acc['end']
+        return acc['start'] < key <= acc['end']
+    return acc['start'] <= key < acc['end']
 
 
 def _ordered(paths, cfg):
@@ -279,14 +312,21 @@ def _declared(cfg):
 
 
 def _open(start, end, declared):
-    return {'start': start, 'end': end, 't': [], 'n_dup': 0,
+    # 'last' starts one microsecond before the earliest instant this period can hold, so
+    # the first sample is later than it under either `closed` and needs no separate test.
+    return {'start': start, 'end': end, 'last': start - 1, 'n': 0, 'n_dup': 0,
             'columns': [[] for _name in declared]}
 
 
 def _close(acc, cfg, declared, counters=None):
-    """Finish one period: the ten arrays and the five meta keys, or None when it is short."""
-    label = '%s .. %s' % (acc['start'], acc['end'])
-    n = len(acc['t'])
+    """Finish one period: the ten arrays and the five meta keys, or None when it is short.
+
+    The two datetimes this builds are the only ones the stream costs: the samples
+    themselves are counted and ordered on the integer clock of ``_key``.
+    """
+    start, end = _moment(acc['start']), _moment(acc['end'])
+    label = '%s .. %s' % (start, end)
+    n = acc['n']
     if acc['n_dup']:
         logger.warning('period %s: dropped %d row(s) whose timestamp repeats an earlier '
                        'one; the first sample at each instant is kept', label, acc['n_dup'])
@@ -299,10 +339,9 @@ def _close(acc, cfg, declared, counters=None):
         logger.warning('period %s: %d row(s) is below [period] min_samples = %d; the period '
                        'is skipped', label, n, cfg.period.min_samples)
         return None
-    period = {'meta': {'period_start': acc['start'], 'period_end': acc['end'],
+    period = {'meta': {'period_start': start, 'period_end': end,
                        'n_in': n, 'n_dup': acc['n_dup'],
-                       'freq_hz': cfg.period.acquisition_frequency},
-              't': acc['t']}
+                       'freq_hz': cfg.period.acquisition_frequency}}
     for name, column in zip(declared, acc['columns']):
         period[name] = kernels.from_values(column)
     for name in SERIES:
@@ -398,15 +437,26 @@ def _unreadable(path, cfg, exc):
 
 
 def _samples(path, cfg, declared):
-    """Yield ``(datetime, [float, ...], lineno)`` for every data row of one file.
+    """Yield ``(key, [float, ...], lineno)`` for every data row of one file.
 
-    The floats are in the order of ``declared`` and already in canonical units. Every
-    refusal names the file and the 1-based line number.
+    ``key`` is the sample instant as whole microseconds since EPOCH (``_key``). The floats
+    are in the order of ``declared`` and already in canonical units. Every refusal names
+    the file and the 1-based line number.
+
+    Each test around ``float()`` below earns its place: ``strip`` because an NA token may
+    be written with spaces around it, the NA test *before* the conversion because a
+    sentinel like -9999 is a number ``float()`` would happily return, and the underscore
+    scan because PEP 515 makes '1_0' one too. Calling ``float()`` first and sorting the
+    rest out in the exception path was measured and is not faster -- ``float()`` itself is
+    most of what this loop costs, and the three tests together are a fraction of it.
     """
     plan = None
     first = last = None
     count = 0
+    kind = cfg.timestamp.format
+    cut = 19 if kind == 'iso' else 14
     seconds = {}
+    fractions = {}
     # A set for the per-token test, which runs once per declared column of every row; the
     # configured tuple keeps its order for the message that names it.
     na_values = frozenset(cfg.files.na_values)
@@ -422,7 +472,7 @@ def _samples(path, cfg, declared):
                             'configuration reads column %d'
                             % (path, lineno, len(row), width))
         try:
-            stamp = _stamp(row[time_index], cfg.timestamp.format, seconds)
+            key = _key(row[time_index], kind, cut, seconds, fractions)
         except ReadError as exc:
             raise ReadError('%s line %d: %s' % (path, lineno, exc))
         values = []
@@ -432,10 +482,9 @@ def _samples(path, cfg, declared):
                 values.append(kernels.NAN)
                 continue
             try:
-                # float() also accepts PEP 515 digit grouping, so '1_0' would arrive as
-                # 10.0. No logger writes that; a token carrying one is corruption, and
-                # reading it as a number is the "looks right and is not" case CONTRACT 19
-                # refuses.
+                # A token carrying a digit-grouping underscore is corruption, and reading
+                # it as the number float() makes of it is the "looks right and is not"
+                # case CONTRACT 19 refuses.
                 if '_' in token:
                     raise ValueError(token)
                 values.append(float(token) * a + b)
@@ -443,9 +492,9 @@ def _samples(path, cfg, declared):
                 _refuse_number(row[index], cfg, path, lineno, column)
         count += 1
         if first is None:
-            first = stamp
-        last = stamp
-        yield stamp, values, lineno
+            first = key
+        last = key
+        yield key, values, lineno
     if plan is None:
         raise ReadError('%s has no line %d for [files] header_line to read the column '
                         'names from' % (path, cfg.files.header_line))
@@ -494,10 +543,14 @@ def _refuse_number(text, cfg, path, lineno, column):
 
 
 def _check_rate(path, cfg, count, first, last):
-    """Compare the observed sample rate with the configured one; the configured one wins."""
+    """Compare the observed sample rate with the configured one; the configured one wins.
+
+    first and last are the keys of the first and the last row of the file, so their
+    difference is the span of the file in whole microseconds.
+    """
     if count < 2 or last <= first:
         return
-    observed = (count - 1) / (last - first).total_seconds()
+    observed = (count - 1) * US / (last - first)
     if abs(observed - cfg.period.acquisition_frequency) > \
             RATE_TOLERANCE * cfg.period.acquisition_frequency:
         logger.warning('%s: its %d rows arrive at %.4g Hz, but [period] '

@@ -26,7 +26,6 @@ A period is a plain `dict`. It is created by `read.py` and mutated in place by e
 ```python
 period = {
     'meta':  {},                 # dict[str, float|int|bool|str|datetime]
-    't':     [datetime, ...],    # length N, strictly the parsed sample clock
     'u':     array('d'),         # length N
     'v':     array('d'),
     'w':     array('d'),
@@ -41,8 +40,7 @@ period = {
 ```
 
 All eleven series keys are **always present** and always `array('d')` of the same length
-`N`. A variable with no source in the file is an all-NaN array, never a missing key. `t` is
-a plain `list` of `datetime.datetime` (naive, no timezone), length `N`, non-decreasing.
+`N`. A variable with no source in the file is an all-NaN array, never a missing key.
 
 `period['meta']` is **flat**: string keys, scalar values. No nesting, no tuples as keys.
 Every meta key is listed in §17.
@@ -73,6 +71,35 @@ handled by the caller, which always rebinds). A step:
 
 Adding a step means writing such a function and adding its name to `pipeline.STEPS`.
 Nothing else.
+
+### 1.2 There is no per-sample time
+
+The period carries **no `t` key**. The sample clock it was cut on leaves `read.py` as
+`meta['period_start']` and `meta['period_end']`, and as the order of the series: the
+samples are in strictly increasing clock order, index `i` being earlier than index `i+1`.
+
+It was a `list` of `N` `datetime` objects and nothing read it — not one step, not
+`write.py`, not `qc.py`. Building it cost 36000 datetime constructions and 36000 appends
+per half hour against the two instants a period is actually labelled by, which on the
+35633-row FR-Jus file is two fifths of the timestamp work and about a tenth of the whole
+parse loop. A key nothing consumes is not a contract, it is a cost, so `read.py` now cuts
+periods, tests for duplicates and counts samples on an integer clock of whole microseconds
+since 1970 (§7.1) and builds no datetime per sample at all.
+
+A fork that wants per-sample times has two honest ways to get them:
+
+* **Re-derive them.** For a regular stream they are exact arithmetic, not data:
+  `period_start + i / freq_hz` seconds, with `freq_hz` in `meta` — the same even spacing
+  `lag` already converts its shift with, and that `detrend` and `despike` work on when
+  they fit and scan against the sample index.
+* **Keep the list yourself.** A fork's own `read.py` may put any key it likes in the
+  period dict; nothing downstream looks at a key it does not know, so a `t` costs only the
+  fork that wants one.
+
+What a fork must **not** do is re-derive the times and then treat them as measured: a gap
+in the stream is a missing row, not a missing instant, so `period_start + i / freq_hz`
+labels samples after a gap earlier than they were recorded. `n_in` against the period
+width is what says whether the stream had gaps at all.
 
 ---
 
@@ -530,6 +557,15 @@ parses the timestamp, converts the declared columns with their affine map, and a
 period currently being accumulated. A period is yielded as soon as a sample with a later
 period key arrives, and the last one is yielded at end of input.
 
+**The clock is an integer.** A timestamp token becomes whole microseconds since 1970-01-01,
+sliced out of the text: the whole second is parsed once and cached per file, the fraction is
+read as its own digits, and the two are added. That int is what the period cut, the
+duplicate test and the sample count all run on, so the answers are exact arithmetic and not
+a datetime comparison — `closed` still places a boundary sample exactly where ALGORITHMS
+0.1 puts it, because the cut is the same floor on the same quantity in the same unit.
+`datetime` objects are built in two places only: `period_start` and `period_end` when a
+period is closed, and the text of a refusal.
+
 Reads from config: `[files] *`, `[timestamp] *`, `[variables] *`, `[units] *`,
 `[gases] *_measure_type`, `[period] averaging_minutes/closed/min_samples`,
 `[site] pressure_pa`.
@@ -538,7 +574,8 @@ Every conversion `read.py` performs is **affine**. The one non-affine conversion
 does — a cell molar density into a dry mixing ratio — is a step of its own (§7A), which is
 why `t_cell` and `p_cell` arrive downstream as series instead of being consumed here.
 
-Writes to the period: all eleven series keys, `t`, and these meta keys:
+Writes to the period: all eleven series keys and these meta keys — and no per-sample time
+(§1.2):
 
 | meta key | type | unit | meaning |
 |---|---|---|---|
@@ -566,9 +603,12 @@ Writes to the period: all eleven series keys, `t`, and these meta keys:
 
 ### 7.4 Guarantees to downstream modules
 
-`t` is non-decreasing. All eleven series have equal length. A series whose column is absent
-is all-NaN (`ta`, `t_cell`, `p_cell`) or constant (`p_air` from `[site] pressure_pa`).
-Units are canonical (§2).
+The samples are in **strictly increasing clock order** — index `i` is earlier than index
+`i+1`, never equal, because the keep-first rule of §7.3 drops a repeat rather than storing
+it. All eleven series have equal length. A series whose column is absent is all-NaN (`ta`,
+`t_cell`, `p_cell`) or constant (`p_air` from `[site] pressure_pa`). Units are canonical
+(§2). Every sample lies inside `[period_start, period_end]` on the side `closed` names, and
+nothing downstream is told which instant any one of them carries (§1.2).
 
 ---
 
@@ -1109,6 +1149,10 @@ python -m miniflux check CONFIG.ini            # parse + validate + echo describ
 | `fc_spec`, `e_spec`, `le_spec` | float | see §12A | spectral |
 | `sst_pct`, `sst_flag`, `itc_w`, `itc_u`, `itc_t`, `tstar` | float/int | see §13 | qc |
 
+`period_start`, `period_end` and `freq_hz` are the **whole** clock a period carries: there
+is no per-sample time key here or anywhere else in the dict, and §1.2 says why and what to
+do instead. Anything that wants the instant of sample `i` re-derives it from those three.
+
 The six `cell` keys and the five `spectral` keys are written **only** when that step does
 something (a gas in `cfg.gases.convert_cell`; `[spectral] enabled = true`). Absent is how
 "this run did not do that" is spelled, and `write.py` renders it as `na_value`.
@@ -1351,7 +1395,7 @@ uncorrected one never share a column.
 | `test_kernels.py` | every kernel's pure semantics, including NaN and short-series edges |
 | `test_kernels_parity.py` | §3.8; skipped when numpy is absent |
 | `test_config.py` | every refusal in §5.2, and that every default in §6 round-trips |
-| `test_read.py` | both timestamp shapes, `closed` left/right boundary placement, duplicate handling, each `ReadError` |
+| `test_read.py` | both timestamp shapes, `closed` left/right boundary placement to the microsecond, the per-line quoted/unquoted split and a file that mixes them, duplicate handling, each `ReadError` |
 | `test_cell.py` | ALGORITHMS §2A: the round trip, the dilution divisor, that it is per sample, every degeneracy, and one synthetic half hour declared **both** ways through the whole pipeline |
 | `test_spectral.py` | ALGORITHMS §10A: both stability branches and their two check values, the monotonicities, the publishing rule, every guard |
 | `test_despike.py` | ALGORITHMS §14.2 |

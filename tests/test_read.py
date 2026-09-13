@@ -214,15 +214,23 @@ class Toa5FixtureTest(ReadTestCase):
             self.assertIsInstance(self.period[name], array, name)
             self.assertEqual(self.period[name].typecode, 'd', name)
             self.assertEqual(len(self.period[name]), 200, name)
-        self.assertEqual(len(self.period['t']), 200)
-        self.assertIsInstance(self.period['t'], list)
+
+    def test_the_period_carries_no_per_sample_time(self):
+        # CONTRACT 1.2: the sample clock leaves read.py as the two period boundaries and
+        # as the order and count of the series, never as a list of 36000 datetimes.
+        self.assertNotIn('t', self.period)
 
     def test_the_quoted_fractional_timestamps_all_survive(self):
-        self.assertEqual(self.period['t'][0], datetime(2025, 9, 8, 19, 32, 0))
-        self.assertEqual(self.period['t'][1], datetime(2025, 9, 8, 19, 32, 0, 50000))
-        self.assertEqual(self.period['t'][-1], datetime(2025, 9, 8, 19, 32, 10, 250000))
-        for earlier, later in zip(self.period['t'], self.period['t'][1:]):
-            self.assertLessEqual(earlier, later)
+        # 200 rows spanning 19:32:00.00 to 19:32:10.25 are 199 gaps over 10.25 s. The
+        # observed rate the file is judged at is that span, so it reads the first and the
+        # last instant back out: lose the fractions and 200 rows fall inside one second.
+        cfg = self.load(FIXTURE_INI, source=FIXTURE)
+        with self.assertLogs('miniflux.read', level='WARNING') as logged:
+            list(read.periods(cfg))
+        self.assertTrue(any('at 19.41 Hz' in line for line in logged.output),
+                        logged.output)
+        self.assertEqual(self.period['meta']['n_in'], 200)
+        self.assertEqual(self.period['meta']['n_dup'], 0)
 
     def test_wind_passes_through_unscaled(self):
         self.assertEqual(self.period['u'][0], 1.801356)
@@ -257,12 +265,16 @@ class Toa5FixtureTest(ReadTestCase):
 
 class NumericTimestampTest(ReadTestCase):
     def test_a_numeric_column_is_read_as_text(self):
-        # Both shapes in one column -- the whole second and the fractions after it.
-        rows = [ROW % '20220512233001', ROW % '20220512233001.05']
+        # Both shapes in one column -- the whole second and the fractions after it. The
+        # three rows are in increasing order only if '.05' is 50000 us and '.5' is 500000:
+        # read as bare digits both are 5 us, the third row repeats the second, and the
+        # keep-first rule drops it.
+        rows = ['20220512233001,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '20220512233001.05,2.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '20220512233001.5,3.0,2.0,3.0,300.0,400.0,10.0,101325.0']
         period = self.read_one(rows, {'timestamp': {'format': 'numeric'}})
-        self.assertEqual(period['t'],
-                         [datetime(2022, 5, 12, 23, 30, 1),
-                          datetime(2022, 5, 12, 23, 30, 1, 50000)])
+        self.assertEqual(list(period['u']), [1.0, 2.0, 3.0])
+        self.assertEqual(period['meta']['n_dup'], 0)
         self.assertEqual(period['meta']['period_end'], datetime(2022, 5, 13, 0, 0))
 
 
@@ -270,17 +282,23 @@ class SecondsCacheTest(ReadTestCase):
     """The samples of one second share the instant of that second and nothing else."""
 
     def test_every_fraction_of_one_second_keeps_its_own_microseconds(self):
-        rows = [ROW % '2025-09-08 19:32:00',
-                ROW % '2025-09-08 19:32:00.000001',
-                ROW % '2025-09-08 19:32:00.05',
-                ROW % '2025-09-08 19:32:00.5',
-                ROW % '2025-09-08 19:32:01']
-        period = self.read_one(rows)
-        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32, 0),
-                                       datetime(2025, 9, 8, 19, 32, 0, 1),
-                                       datetime(2025, 9, 8, 19, 32, 0, 50000),
-                                       datetime(2025, 9, 8, 19, 32, 0, 500000),
-                                       datetime(2025, 9, 8, 19, 32, 1)])
+        # Five instants inside one second, written in increasing order. Any fraction read
+        # at the wrong scale collides with another ('.05' and '.5' are both 5 without the
+        # padding) or inverts the order, and the keep-first rule turns that into a dropped
+        # row and an n_dup: five rows out is five distinct increasing instants in.
+        rows = ['2025-09-08 19:32:00,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.000001,2.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.05,3.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.5,4.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:01,5.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        self.write_csv(rows)
+        with self.assertLogs('miniflux.read', level='WARNING') as logged:
+            found = list(read.periods(self.load()))
+        period = found[0]
+        self.assertEqual(list(period['u']), [1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(period['meta']['n_dup'], 0)
+        # Five rows one second apart end to end: the observed rate reads the span back.
+        self.assertTrue(any('at 4 Hz' in line for line in logged.output), logged.output)
 
     def test_a_bad_fraction_is_still_refused_after_a_good_one_in_the_same_second(self):
         self.write_csv([ROW % '2025-09-08 19:32:00.05',
@@ -290,10 +308,15 @@ class SecondsCacheTest(ReadTestCase):
         self.assertIn('fractional digits', str(caught.exception))
 
     def test_whitespace_around_a_timestamp_is_tolerated_row_after_row(self):
+        # A padded token slices into its own seconds field, so it misses both caches every
+        # time and is parsed in full; the second it lands in is still its own.
         rows = [ROW % ' 2025-09-08 19:32:00.05 ', ROW % ' 2025-09-08 19:32:01.05 ']
-        period = self.read_one(rows)
-        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32, 0, 50000),
-                                       datetime(2025, 9, 8, 19, 32, 1, 50000)])
+        self.write_csv(rows)
+        with self.assertLogs('miniflux.read', level='WARNING') as logged:
+            found = list(read.periods(self.load()))
+        self.assertEqual(found[0]['meta']['n_in'], 2)
+        self.assertEqual(found[0]['meta']['n_dup'], 0)
+        self.assertTrue(any('at 1 Hz' in line for line in logged.output), logged.output)
 
 
 class ClosedTest(ReadTestCase):
@@ -317,6 +340,27 @@ class ClosedTest(ReadTestCase):
                          [datetime(2025, 9, 8, 20, 0)])
         self.assertEqual(found[0]['meta']['n_in'], 2)
         self.assertEqual(list(found[0]['u']), [1.0, 4.0])
+
+    # One microsecond either side of 19:30:00 and the instant itself. The cut runs on
+    # whole microseconds, so only the middle row is on the boundary and only it moves
+    # between the two conventions: each of these two tests is the other one's failure.
+    EDGE = ['2025-09-08 19:29:59.999999,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+            '2025-09-08 19:30:00.000000,2.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+            '2025-09-08 19:30:00.000001,3.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+
+    def test_one_microsecond_either_side_of_the_boundary_closed_right(self):
+        self.write_csv(self.EDGE)
+        found = list(read.periods(self.load({'period': {'closed': 'right'}})))
+        self.assertEqual([p['meta']['period_end'] for p in found],
+                         [datetime(2025, 9, 8, 19, 30), datetime(2025, 9, 8, 20, 0)])
+        self.assertEqual([list(p['u']) for p in found], [[1.0, 2.0], [3.0]])
+
+    def test_one_microsecond_either_side_of_the_boundary_closed_left(self):
+        self.write_csv(self.EDGE)
+        found = list(read.periods(self.load({'period': {'closed': 'left'}})))
+        self.assertEqual([p['meta']['period_end'] for p in found],
+                         [datetime(2025, 9, 8, 19, 30), datetime(2025, 9, 8, 20, 0)])
+        self.assertEqual([list(p['u']) for p in found], [[1.0], [2.0, 3.0]])
 
 
 class DuplicateAndBackwardsTest(ReadTestCase):
@@ -343,8 +387,8 @@ class DuplicateAndBackwardsTest(ReadTestCase):
                 '2025-09-08 19:32:00.10,4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
         period = self.read_one(rows)
         self.assertEqual(list(period['u']), [1.0, 4.0])
+        self.assertEqual(period['meta']['n_in'], 2)
         self.assertEqual(period['meta']['n_dup'], 1)
-        self.assertEqual(period['t'], sorted(period['t']))
 
     def test_a_sample_falling_back_into_a_closed_period_is_refused(self):
         # ALGORITHMS 2.3 scopes the keep-first rule to duplicates *within a period*. A
@@ -410,8 +454,18 @@ class QuotingTest(ReadTestCase):
                 '"2025-09-08 19:32:00.05",4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
         period = self.read_one(rows)
         self.assertEqual(list(period['u']), [1.0, 4.0])
-        self.assertEqual(period['t'], [datetime(2025, 9, 8, 19, 32),
-                                       datetime(2025, 9, 8, 19, 32, 0, 50000)])
+        # Two distinct instants, so the quotes came off before the timestamp was parsed.
+        self.assertEqual(period['meta']['n_dup'], 0)
+        self.assertEqual(period['meta']['period_end'], datetime(2025, 9, 8, 20, 0))
+
+    def test_a_quoted_header_over_unquoted_data_rows(self):
+        # The other half of the TOA5 shape: the names are quoted, the rows below them are
+        # not, so the choice of split is made per line within one file.
+        rows = ['2025-09-08 19:32:00,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',
+                '2025-09-08 19:32:00.05,4.0,2.0,3.0,300.0,400.0,10.0,101325.0']
+        header = ','.join('"%s"' % name for name in HEADER.split(','))
+        period = self.read_one(rows, header=header)
+        self.assertEqual(list(period['u']), [1.0, 4.0])
 
     def test_one_quoted_line_in_the_middle_of_an_unquoted_file(self):
         rows = ['2025-09-08 19:32:00,1.0,2.0,3.0,300.0,400.0,10.0,101325.0',

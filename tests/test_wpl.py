@@ -77,7 +77,7 @@ def _period(**overrides):
     })
     meta.update(overrides)
     zero_mean = array('d', [-1.0, 1.0, -1.0, 1.0])
-    period = {'meta': meta, 't': []}
+    period = {'meta': meta}
     for name in ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air'):
         period[name] = array('d', zero_mean)
     return period, state

@@ -36,10 +36,7 @@ def make_period(**series):
     from the given lists of float, the rest all-NaN arrays of the same length."""
     n = len(next(iter(series.values()))) if series else 0
     start = datetime.datetime(2023, 7, 8, 12, 0, 0)
-    period = {
-        'meta': {},
-        't': [start + datetime.timedelta(seconds=0.05 * i) for i in range(n)],
-    }
+    period = {'meta': {}}
     for name in SERIES:
         values = series.get(name)
         period[name] = kernels.from_values(values) if values is not None else kernels.new(n)

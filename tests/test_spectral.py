@@ -31,7 +31,7 @@ def _cfg(enabled=True, co2_tau=TAU, h2o_tau=TAU, height=2.0, displacement=0.1):
 def _period(**meta):
     base = {'wind_speed': WIND, 'z_l': -0.5, 'fc': -2.0e-5, 'e': 8.0e-5, 'le': 200.0}
     base.update(meta)
-    return {'meta': base, 't': []}
+    return {'meta': base}
 
 
 def _horst(wind, height, z_l, tau):

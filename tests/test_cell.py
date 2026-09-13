@@ -60,7 +60,7 @@ def _period(n_co2, n_h2o, t_cell=T_CELL, p_cell=P_CELL, extra=None):
     def series(value):
         return array('d', value if isinstance(value, (list, tuple)) else [value] * 4)
 
-    period = {'meta': {}, 't': [],
+    period = {'meta': {},
               'co2': series(n_co2), 'h2o': series(n_h2o),
               't_cell': series(t_cell), 'p_cell': series(p_cell)}
     for name in ('u', 'v', 'w', 'ts', 'ta', 'p_air'):
@@ -336,7 +336,7 @@ class TwoWayAgreement(unittest.TestCase):
         period = {'meta': {'period_start': self.t[0],
                            'period_end': self.t[0] + timedelta(minutes=30),
                            'n_in': len(self.t), 'n_dup': 0, 'freq_hz': 10.0},
-                  't': list(self.t), 'ta': kernels.new(len(self.t))}
+                  'ta': kernels.new(len(self.t))}
         for name, series in values.items():
             period[name] = kernels.from_values(series)
         return period

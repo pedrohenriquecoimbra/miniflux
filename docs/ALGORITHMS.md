@@ -205,6 +205,12 @@ carries 16 significant digits and a double carries ~15.95.
 belongs to the *earlier* period under `closed = right` and to the *later* one under
 `closed = left`.
 
+The instant and the interval `A` are both carried as **whole microseconds since
+1970-01-01**, as exact Python ints: `floor` is then one integer remainder and "exactly on a
+boundary" is an exact equality, not a comparison of two rounded quantities. The two
+boundaries of a period become datetimes when it closes; the samples themselves never do,
+and what leaves this stage carries no per-sample time at all (CONTRACT §1.2).
+
 File boundaries are irrelevant: a logger file may straddle a period boundary (the FR-Jus
 TOA5 file spans 19:32:00.00 to 20:01:59.95). Periods are cut on the sample clock after the
 input files have been concatenated in timestamp order.

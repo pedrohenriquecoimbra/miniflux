@@ -23,7 +23,7 @@ DETRENDABLE = ('u', 'v', 'w', 'ts', 'co2', 'h2o')
 def make_period(**series):
     """A period dict carrying all nine series keys; unnamed ones are all-NaN."""
     n = max(len(v) for v in series.values())
-    period = {'meta': {}, 't': [datetime(2020, 6, 1, 12, 0)] * n}
+    period = {'meta': {}}
     for name in SERIES:
         period[name] = kernels.from_values(series[name]) if name in series else kernels.new(n)
     return period

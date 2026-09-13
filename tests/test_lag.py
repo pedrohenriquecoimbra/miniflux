@@ -57,7 +57,7 @@ def planted(n, samples, seed=7):
 
 def make_period(w, scalars, freq=10.0):
     """A period dict of the contract's shape carrying w and the named scalars."""
-    period = {'meta': {'freq_hz': freq}, 't': []}
+    period = {'meta': {'freq_hz': freq}}
     for key in SERIES_KEYS:
         period[key] = kernels.new(len(w))
     period['w'] = kernels.from_values(w)

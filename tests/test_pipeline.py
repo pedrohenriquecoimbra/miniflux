@@ -112,7 +112,6 @@ def synthetic_period(n=1200, freq=10.0):
         'meta': {'period_start': start,
                  'period_end': start + timedelta(minutes=30),
                  'n_in': n, 'n_dup': 0, 'freq_hz': freq},
-        't': [start + timedelta(seconds=i / freq) for i in range(n)],
         # No measured air temperature in this file: an all-NaN series, never a missing key.
         'ta': kernels.new(n),
     }

@@ -41,7 +41,7 @@ def make_period(**series):
     """A period dict whose nine series are all present and the same length."""
     lengths = set(len(v) for v in series.values())
     n = lengths.pop() if lengths else 0
-    period = {'meta': {}, 't': [None] * n}
+    period = {'meta': {}}
     for name in ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air'):
         values = series.get(name)
         period[name] = array.array('d', values) if values is not None \

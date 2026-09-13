@@ -25,7 +25,7 @@ SERIES = ('u', 'v', 'w', 'ts', 'co2', 'h2o', 'ta', 'p_air')
 
 def make_period(u, v, w):
     """A period dict holding the three wind series; every other series is all-NaN."""
-    period = {'meta': {}, 't': []}
+    period = {'meta': {}}
     for name in SERIES:
         period[name] = kernels.new(len(u))
     period['u'] = kernels.from_values(u)
