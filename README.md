@@ -14,11 +14,11 @@ statements and the rest comment and docstring.
 Two documents are the law, and the code is checked against them line by line:
 
 * [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) — the mathematics: every formula, constant,
-  default, edge case and citation (1,194 lines).
+  default, edge case and citation (1,656 lines).
 * [`docs/CONTRACT.md`](docs/CONTRACT.md) — the plumbing: every module, signature, meta key,
-  config key and refusal (1,063 lines).
+  config key and refusal (1,523 lines).
 
-Python >= 3.8. EUPL-1.2. 478 tests, `unittest` only.
+Python >= 3.8. EUPL-1.2. 582 tests, `unittest` only.
 
 ## Why it exists
 
@@ -65,7 +65,7 @@ From a checkout, with nothing installed:
 
 ```sh
 cd miniflux
-python -m unittest discover -s tests -t .          # 478 tests, about 4 s
+python -m unittest discover -s tests -t .          # 582 tests, about 6 s
 python examples/make_sample.py                     # writes ./sample_20hz.dat, 36000 samples
 python -m miniflux check examples/miniflux.ini     # validate and echo the config, read no data
 python -m miniflux run examples/miniflux.ini       # -> ./miniflux.csv + ./miniflux_units.csv
@@ -167,10 +167,11 @@ corrected name. Everything else degenerate is NaN in the meta, `-9999` in the ta
 
 ## Extending it
 
-A step is a function `(period, cfg) -> period`. `period` is a plain dict: `'meta'`, `'t'`,
-and nine `array('d')` series of equal length (`u v w ts co2 h2o ta p_air`), where missing is
-always NaN. Adding one means writing the function and putting its name in `pipeline.STEPS`.
-There is nothing else to update.
+A step is a function `(period, cfg) -> period`. `period` is a plain dict: `'meta'` and ten
+`array('d')` series of equal length (`u v w ts co2 h2o ta p_air t_cell p_cell`), where
+missing is always NaN and where there is no per-sample time at all (`CONTRACT.md` §1.2 says
+why, and how to re-derive one). Adding a step means writing the function and putting its
+name in `pipeline.STEPS`. There is nothing else to update.
 
 Say you want the skewness of the vertical wind, the first half of a Vickers & Mahrt
 instrument test:
@@ -242,6 +243,39 @@ array layout, NaN bookkeeping and numpy), `constants.py`, or the helpers in `flu
 If you are adding physics rather than a diagnostic, write it into `ALGORITHMS.md` first, with
 its formula and citation, and pin it with a test in the same commit. That is the convention
 the repo is kept under, and it is the reason the code can be checked at all.
+
+### Calling a step from xarray
+
+If your data already lives in an `xarray.Dataset`, one optional file — `xarray_adapter.py`,
+`pip install miniflux-ec[xarray]` — lets you run any miniflux step on it without copying ten
+series and thirty meta keys by hand:
+
+```python
+from miniflux import config, pipeline, xarray_adapter as mfx
+
+cfg = config.load('miniflux.ini')
+ds = mfx.apply('despike', ds, cfg)      # any name in pipeline.STEPS, or the function
+ds = mfx.apply(pipeline.run_period, ds, cfg)   # or the whole pipeline at once
+```
+
+with `to_dataset(period, cfg)` and `from_dataset(dataset, cfg)` underneath it. Each variable
+carries its canonical unit as an attribute, and a Dataset that contradicts one — a declared
+unit that is not the canonical one, a `datetime64` or a bool where a measurement should be —
+is **refused** rather than reinterpreted: a ppm column read as `mol mol-1` looks right all
+the way to the flux. Steps mutate in place, so `apply` copies by default and leaves your
+Dataset untouched; `copy=False` aliases the buffers instead, and then the step's result is
+in your own Dataset when `apply` returns. The time coordinate is rebuilt as
+`period_start + i / freq_hz` and is a label, not a measurement (`CONTRACT.md` §22.3 lists
+what that costs).
+
+This is a boundary, not a change of heart. xarray pulls numpy **and** pandas, of the order of
+a hundred megabytes, which would undo the one property the program is built around, and none
+of its strengths are live on a single-axis 2.3 MB period anyway. So it sits in one file that
+nothing in the core imports, exactly as numpy sits inside `kernels.py`. **miniflux does not
+need xarray**: `import miniflux` still imports nothing, the CLI and the whole pipeline are
+unchanged, and the suite passes on an interpreter that has neither library — the adapter's
+own tests skip, and one of them proves the rest of the program does not care. Delete the
+file and nothing else moves.
 
 ## What it deliberately does not do
 

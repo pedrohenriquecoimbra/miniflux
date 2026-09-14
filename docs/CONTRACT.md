@@ -1406,6 +1406,118 @@ uncorrected one never share a column.
 | `test_wpl.py` | ALGORITHMS §14.5, §14.6; the `off`-but-owed refusal; that a closed-path gas is never owed one |
 | `test_qc.py` | the three flag bounds, non-finite -> flag 2, every ITC guard |
 | `test_pipeline.py` | the step order of §14, a synthetic end-to-end period, and that a raising step still produces a row |
+| `test_xr.py` | §22; skipped when xarray is absent, except the isolation class, which is about that case |
 
 A pull request that changes a number in `ALGORITHMS.md` must change the corresponding test in
 the same commit.
+
+---
+
+## 22. `xarray_adapter.py` — the optional boundary
+
+Not part of the core and not part of the program. `miniflux/xarray_adapter.py` is the only
+file in the package that imports a third party *unconditionally* — `kernels.py` probes for
+numpy inside a `try/except` and runs without it (§3.9) — and it is the only file no other
+module imports. The core does not know it exists; deleting it changes nothing.
+
+```python
+to_dataset(period, cfg, copy=True)    -> xarray.Dataset
+from_dataset(dataset, cfg, copy=True) -> period dict (§1)
+apply(step, dataset, cfg, copy=True)  -> xarray.Dataset
+```
+
+`step` is a `(period, cfg) -> period` callable or the name of one in `pipeline.STEPS`;
+`pipeline.run_period` is such a callable, so the whole pipeline runs on a Dataset too.
+
+**Why it is not the core's data structure.** xarray pulls numpy *and* pandas, of the order
+of a hundred megabytes, against a program whose point is that it runs on whatever Python
+the machine already has. And none of xarray's strengths are live on a period: one axis,
+2.3 MB, in memory, already aligned, already in one vocabulary — nothing to align, nothing
+to broadcast by name, nothing worth deferring. The instinct is right at the **boundary**,
+where the caller may already hold a Dataset, and wrong one level in. This is the shape
+§3.9 already uses for numpy, moved one level out: numpy is optional *inside* a module,
+xarray is optional *outside* every module.
+
+| rule | |
+|---|---|
+| imports | the adapter imports the core; **no module in `miniflux/` may import the adapter** |
+| exceptions | plain `ValueError` / `TypeError`. §19 fixes the package's list at three, all raised by the core; a file outside the core does not add a fourth |
+| vocabulary | §2 and §17 unchanged: the ten series become variables, `meta` becomes `Dataset.attrs` |
+| extra variables | a non-canonical variable is dropped by `from_dataset` (§1 has no room for it) and carried through by `apply` |
+| dtypes | a canonical variable must be a float or an integer. Every other kind — `datetime64`, bool, complex, string, object — is **refused**, not cast: numpy casts them all to `float64` without complaining, and a `datetime64` becomes nanoseconds since the epoch, a bool becomes 1.0, a complex loses its imaginary part, a string of digits is parsed |
+| ragged input | a period handed to `to_dataset` carries all ten §1 keys at one length; a missing key is a `ValueError`, not the `KeyError` a bare lookup would raise |
+
+### 22.1 Copies
+
+A step mutates its series in place, so the direction that matters is `Dataset -> period`.
+
+* `copy=True` (**the default**) gives the step its own memory: `array('d')` series and a
+  fresh `meta` dict. Nothing a step does reaches the caller's Dataset; the result comes
+  back as a new one.
+* `copy=False` aliases: the series share one buffer, `meta` *is* `dataset.attrs`. A step's
+  writes land in the caller's Dataset as well.
+
+Aliasing needs a writable, C-contiguous `float64`, not-dask-backed array, and anything else
+is **refused rather than quietly copied** — a silent copy under `copy=False` means the
+mutation the caller asked for never arrives. The `float64` test is the load-bearing one:
+`kernels` reaches numpy through `np.frombuffer(x, dtype=float64)`, which raises on a list,
+on a `DataArray` and on a strided slice, but on a `float32` array **reinterprets the bytes**
+and returns numbers that are wrong rather than absent. The adapter checks the dtype itself
+instead of leaving it to fail downstream.
+
+Two steps hand back a *new* array rather than writing into the one they were given:
+`rotate` replaces u, v and w (§9), and `lag.apply_lags` replaces each scalar it shifts (§10,
+step 5). `apply` copies those home, so `copy=False` means what it says: when it returns, the
+caller's Dataset and the returned one hold the same result in the same buffer, rebinding
+steps included. Without that write-back a caller who rotated in place and then read their
+own Dataset would be holding **unrotated wind** — wrong rather than absent — and after a
+whole-pipeline `apply(run_period, ds, cfg, copy=False)` not one of the ten series would have
+landed. A step that changed a series' length (none does; `shift_truncate` NaN-fills rather
+than shortening) is refused rather than dropped.
+
+`from_dataset` on its own cannot make that promise — it hands out the aliases and never sees
+the step — so a caller who drives the step themselves reads the returned period, not their
+Dataset.
+
+### 22.2 Units
+
+Every variable carries its §2 unit in `attrs['units']`, and `from_dataset` refuses a
+declared unit that contradicts it. That refusal is what the boundary is *for*: a number
+silently reinterpreted (ppm read as `mol mol-1`, degC read as K) looks right all the way to
+the flux. A short synonym list (`m/s` for `m s-1`, and so on) is accepted; anything else is
+a different number. An **absent** `units` attribute is not a contradiction and passes — the
+caller asserting canonical units by saying nothing is the one thing the adapter cannot
+check.
+
+A gas's unit depends on its measure type, and which type applies depends on where in the
+pipeline the period is: `cell.convert` rewrites a cell molar density into a dry mixing
+ratio, and `cfg.gases.measure_type` is already the *effective*, post-conversion type
+(§5.1). Before that step has run the numbers are still `mol m-3`, so the label is chosen on
+`cfg.gases.convert_cell` together with the presence of `n_cell_converted` — the key
+`cell.convert` writes exactly when it has work to do (§7A).
+
+### 22.3 The time coordinate
+
+The period carries no per-sample time (§1.2), so the coordinate is rebuilt as
+`period_start + i / freq_hz`, which for a regular stream is exact arithmetic and not data.
+It is a **label**, and two things it is not:
+
+* a **gap** in the stream is a missing row, not a missing instant, so every sample after a
+  gap is labelled earlier than it was recorded — `meta['n_in']` against the period width is
+  what says whether that happened;
+* with `[period] closed = right` the first sample sits one interval *after* `period_start`,
+  because the origin is the period's boundary, not the first sample.
+
+`to_dataset` always builds a coordinate, because a bare period has nowhere else to put its
+clock. `apply` gives back the caller's: the same coordinate when there was one, and **none**
+when there was not — handing back an index the caller never had is something a later `merge`
+or `concat` would silently align on.
+
+A period with no `period_start` gets a plain integer sample index instead of an invented
+clock. Offsets are rounded to the nanosecond one at a time, so a frequency whose interval
+is not a whole number of nanoseconds (3 Hz; 10, 20 and 100 Hz are exact) is off by at most
+half a nanosecond per sample and never accumulates.
+
+`period_start` and `period_end` reach `Dataset.attrs` as `datetime` objects, which is fine
+in memory and is not what `to_netcdf` accepts. Encoding them is the caller's decision, not
+the adapter's.

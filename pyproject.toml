@@ -27,6 +27,11 @@ dependencies = []
 # Purely a speed switch: the same numbers, computed faster. Nothing imports
 # numpy at module level; kernels.py probes for it once and falls back.
 fast = ["numpy>=1.17"]
+# The optional boundary of CONTRACT section 22: miniflux/xarray_adapter.py, and nothing
+# else. No module in the core imports it, and the program and the suite run with xarray
+# absent. Floor: the oldest release it has been tested against (with numpy 1.24, Python
+# 3.8); it is also tested on 2025.6 and 2026.7.
+xarray = ["xarray>=2022.11"]
 
 [project.scripts]
 miniflux = "miniflux.cli:main"
