@@ -13,9 +13,9 @@ statements and the rest comment and docstring.
 
 Two documents are the law, and the code is checked against them line by line:
 
-* [`docs/ALGORITHMS.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/docs/ALGORITHMS.md) — the mathematics: every formula, constant,
+* [`docs/ALGORITHMS.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/docs/ALGORITHMS.md) — the mathematics: every formula, constant,
   default, edge case and citation (1,656 lines).
-* [`docs/CONTRACT.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/docs/CONTRACT.md) — the plumbing: every module, signature, meta key,
+* [`docs/CONTRACT.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/docs/CONTRACT.md) — the plumbing: every module, signature, meta key,
   config key and refusal (1,523 lines).
 
 Python >= 3.8. EUPL-1.2. 582 tests, `unittest` only.
@@ -108,7 +108,7 @@ says it is" without parsing the log.
 
 ## Configuration
 
-One `.ini` file, every key documented in [`examples/miniflux.ini`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/examples/miniflux.ini) and
+One `.ini` file, every key documented in [`examples/miniflux.ini`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/examples/miniflux.ini) and
 specified in `CONTRACT.md` §6. The dozen that matter:
 
 ```ini
@@ -311,7 +311,7 @@ cannot go.
 A 36,000-sample period takes a couple of seconds end to end on the pure-Python path and about
 half that with numpy on the machine this was written on — seconds per period, not minutes;
 measured numbers, on real files and both paths, are in
-[`docs/BENCHMARK.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/docs/BENCHMARK.md). numpy is a speed switch and nothing else: every
+[`docs/BENCHMARK.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/docs/BENCHMARK.md). numpy is a speed switch and nothing else: every
 decision (spike mask, selected lag, QC flag) is bit-for-bit identical between the two paths
 and reductions agree within 8 ULP, which the suite asserts at 1e-12 relative. On the shipped
 sample, `--pure` and the numpy path write byte-identical tables.
@@ -322,13 +322,13 @@ The suite pins every formula in `ALGORITHMS.md` against hand-computed test vecto
 eight end-to-end self-tests of §14 (rotation invariants, lag sign, WPL magnitude on a known
 parcel, Schotanus contrast, numpy parity) are part of it. What has and has not been
 compared against a reference implementation on real data is written up in
-[`docs/VALIDATION.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/docs/VALIDATION.md) — read it before you report a miniflux number.
+[`docs/VALIDATION.md`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/docs/VALIDATION.md) — read it before you report a miniflux number.
 Where miniflux and `ONEFlux_preproc` disagree numerically, `ONEFlux_preproc` is right and
 miniflux has a bug.
 
 ## Licence and provenance
 
-EUPL-1.2. See [`LICENCE`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/LICENCE); copyright (c) 2026 Pedro Henrique Herig Coimbra.
+EUPL-1.2. See [`LICENCE`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/LICENCE); copyright (c) 2026 Pedro Henrique Herig Coimbra.
 
 miniflux is a minimal reimplementation of the flux path of `oneflux_preproc` v0.10.0, by the
 same author, also under the EUPL-1.2. The physics, the constants and the numerical
@@ -338,4 +338,4 @@ code here is written from scratch against the standard library, and the pipeline
 ordered list of functions rather than a registry. `oneflux_preproc` carries the engine
 comparisons, the provenance record, the spectral corrections and the published parity against
 EddyPro and GEddySoft; miniflux carries none of that on purpose. Full method citations are in
-[`NOTICE`](https://github.com/pedrohenriquecoimbra/miniflux/blob/main/NOTICE) and §15 of `ALGORITHMS.md`.
+[`NOTICE`](https://github.com/pedrohenriquecoimbra/miniflux/blob/v0.1.0/NOTICE) and §15 of `ALGORITHMS.md`.
