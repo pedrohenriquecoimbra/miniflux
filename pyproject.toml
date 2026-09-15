@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miniflux-ec"
-version = "0.1.0"
+version = "0.1.1"
 description = "A minimal eddy-covariance flux program: raw high-frequency data in, one flux row per averaging period out, on the standard library alone."
 readme = "README.md"
 license = "EUPL-1.2"

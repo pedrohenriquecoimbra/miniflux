@@ -8,4 +8,4 @@ Importing the package imports nothing else: the modules are independent, and num
 optional speed switch, never a dependency) is probed for only when ``kernels`` is imported.
 """
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
