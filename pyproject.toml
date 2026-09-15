@@ -33,6 +33,13 @@ fast = ["numpy>=1.17"]
 # 3.8); it is also tested on 2025.6 and 2026.7.
 xarray = ["xarray>=2022.11"]
 
+# The two documents the README calls the law live in docs/ and are not shipped in either
+# distribution; on PyPI these links are the only route to them.
+[project.urls]
+Homepage = "https://github.com/pedrohenriquecoimbra/miniflux"
+Source = "https://github.com/pedrohenriquecoimbra/miniflux"
+Issues = "https://github.com/pedrohenriquecoimbra/miniflux/issues"
+
 [project.scripts]
 miniflux = "miniflux.cli:main"
 
